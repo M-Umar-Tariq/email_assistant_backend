@@ -28,7 +28,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "corsheaders",
     "database.apps.DatabaseConfig",
-    "api",
+    "api.apps.ApiConfig",
 ]
 
 # ---------------------------------------------------------------------------

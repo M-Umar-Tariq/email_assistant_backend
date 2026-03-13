@@ -4,7 +4,6 @@ from rest_framework import serializers
 class FollowUpCreateSerializer(serializers.Serializer):
     email_id = serializers.CharField()
     due_date = serializers.DateTimeField()
-    suggested_action = serializers.CharField(required=False, default="")
 
 
 class FollowUpUpdateSerializer(serializers.Serializer):
@@ -13,7 +12,6 @@ class FollowUpUpdateSerializer(serializers.Serializer):
         required=False,
     )
     due_date = serializers.DateTimeField(required=False)
-    suggested_action = serializers.CharField(required=False)
 
 
 class FollowUpResponseSerializer(serializers.Serializer):
@@ -23,6 +21,5 @@ class FollowUpResponseSerializer(serializers.Serializer):
     due_date = serializers.DateTimeField()
     status = serializers.CharField()
     auto_reminder_sent = serializers.BooleanField()
-    suggested_action = serializers.CharField()
     days_waiting = serializers.IntegerField()
     created_at = serializers.DateTimeField()

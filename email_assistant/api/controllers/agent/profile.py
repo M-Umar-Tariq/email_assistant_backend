@@ -57,15 +57,21 @@ def _analyse_metadata(user_id: str) -> dict:
     unread = col.count_documents({"user_id": user_id, "read": False})
     starred = col.count_documents({"user_id": user_id, "starred": True})
 
-    top_senders = list(col.aggregate([
-        {"$match": {"user_id": user_id}},
-        {"$group": {
-            "_id": {"from_email": "$from_email", "from_name": "$from_name"},
-            "count": {"$sum": 1},
-        }},
-        {"$sort": {"count": -1}},
-        {"$limit": 15},
-    ]))
+    # Sender info lives in Qdrant, not MongoDB — aggregate from there
+    from collections import Counter
+    all_emails = scroll_all_chunk0(user_id)
+    sender_counter: Counter = Counter()
+    sender_names: dict[str, str] = {}
+    for e in all_emails:
+        addr = e.get("from_email", "")
+        if addr:
+            sender_counter[addr] += 1
+            if not sender_names.get(addr):
+                sender_names[addr] = e.get("from_name", "")
+    top_senders = [
+        {"email": addr, "name": sender_names.get(addr, ""), "count": count}
+        for addr, count in sender_counter.most_common(15)
+    ]
 
     by_hour = list(col.aggregate([
         {"$match": {"user_id": user_id, "date": {"$ne": None}}},
@@ -85,14 +91,7 @@ def _analyse_metadata(user_id: str) -> dict:
         "total_emails": total,
         "unread": unread,
         "starred": starred,
-        "top_senders": [
-            {
-                "email": s["_id"].get("from_email", ""),
-                "name": s["_id"].get("from_name", ""),
-                "count": s["count"],
-            }
-            for s in top_senders
-        ],
+        "top_senders": top_senders,
         "activity_by_hour": {str(h["_id"]): h["count"] for h in by_hour},
         "activity_by_day": {str(d["_id"]): d["count"] for d in by_dow},
     }

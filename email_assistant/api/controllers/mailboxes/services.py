@@ -83,13 +83,15 @@ def list_mailboxes(user_id: str) -> list[dict]:
     for d in docs:
         out = _serialize(d)
         now = datetime.now(timezone.utc)
-        out["total_emails"] = email_metadata_col().count_documents({
+        base_q = {
             "user_id": user_id,
             "mailbox_id": str(d["_id"]),
             "archived": False,
             "trashed": False,
             "$or": [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}],
-        })
+        }
+        out["total_emails"] = email_metadata_col().count_documents(base_q)
+        out["unread"] = email_metadata_col().count_documents({**base_q, "read": False})
         result.append(out)
     return result
 
@@ -100,13 +102,15 @@ def get_mailbox(user_id: str, mailbox_id: str) -> dict | None:
         return None
     out = _serialize(doc)
     now = datetime.now(timezone.utc)
-    out["total_emails"] = email_metadata_col().count_documents({
+    base_q = {
         "user_id": user_id,
         "mailbox_id": mailbox_id,
         "archived": False,
         "trashed": False,
         "$or": [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}],
-    })
+    }
+    out["total_emails"] = email_metadata_col().count_documents(base_q)
+    out["unread"] = email_metadata_col().count_documents({**base_q, "read": False})
     return out
 
 
@@ -199,6 +203,8 @@ def sync_mailbox(
             return {"synced": 0, "total": total_after, "total_fetched": 0}
         if initial_sync == "last_n" and limit is not None and limit > 0:
             msg_ids = msg_ids[-limit:]
+        # Process newest emails first (IMAP returns UIDs oldest-first by default)
+        msg_ids = list(reversed(msg_ids))
         total_fetched = len(msg_ids)
     except Exception as e:
         mailboxes_col().update_one(
@@ -318,6 +324,13 @@ def sync_mailbox(
                 parsed_date = _parse_date(date_str)
                 if parsed_date and not parsed_date.tzinfo:
                     parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+
+                # IMAP SINCE is date-level only; filter at time-level so
+                # "only new" mailboxes never pull in older same-day emails.
+                since_aware = since.replace(tzinfo=timezone.utc) if since and not since.tzinfo else since
+                if since_aware and parsed_date and initial_sync not in ("last_n", "all") and parsed_date < since_aware:
+                    skipped += 1
+                    continue
 
                 preview = (body[:300] if body else "") or "(no preview)"
 
@@ -461,6 +474,9 @@ def sync_mailbox(
                         "user_id": user_id,
                         "mailbox_id": mailbox_id,
                         "message_id": email_data["mid"],
+                        "subject": email_data.get("subject", ""),
+                        "from_name": email_data.get("from_name", ""),
+                        "from_email": email_data.get("from_email", ""),
                         "date": email_data["date"],
                         "read": email_data["read"],
                         "starred": email_data["starred"],

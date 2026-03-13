@@ -112,7 +112,7 @@ def _build_briefing_items(high_priority: list, recent: list, user_id: str) -> li
                 "id": str(fu["_id"]),
                 "type": "followup",
                 "title": f"Overdue: {content['subject']}" if content else "Overdue follow-up",
-                "description": fu.get("suggested_action", ""),
+                "description": "",
                 "priority": "high",
                 "email_ids": [fu["email_id"]],
             })

@@ -10,7 +10,7 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue
 from database.db import email_metadata_col, mailboxes_col, follow_ups_col, email_attachments_col, get_qdrant
 from api.utils.encryption import decrypt
 from api.utils.email_body import clean_email_body
-from api.utils.qdrant_helpers import get_email_content, get_emails_content_batch
+from api.utils.qdrant_helpers import get_email_content, get_emails_content_batch, get_email_ids_by_sender, scroll_all_chunk0
 from api.controllers.mailboxes import services as mailbox_services
 
 
@@ -63,15 +63,54 @@ def email_stats(user_id: str) -> dict:
     }
 
 
+def unique_senders(user_id: str, mailbox_id: str | None = None) -> dict:
+    """Inbox (non-archived, non-trashed) ke unique senders ka count aur list.
+    from_email lives in Qdrant payloads, not in MongoDB, so we use Qdrant + inbox IDs from MongoDB."""
+    base_q: dict = {"user_id": user_id, "archived": False, "trashed": False}
+    now = datetime.now(timezone.utc)
+    base_q["$or"] = [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}]
+    if mailbox_id:
+        base_q["mailbox_id"] = mailbox_id
+
+    col = email_metadata_col()
+    inbox_ids = {str(d["_id"]) for d in col.find(base_q, {"_id": 1})}
+    if not inbox_ids:
+        return {"unique_senders_count": 0, "senders": []}
+
+    # from_email is in Qdrant; get chunk0 content for user/mailbox and filter to inbox
+    all_content = scroll_all_chunk0(user_id, mailbox_id=mailbox_id)
+    inbox_contents = [c for c in all_content if c.get("email_id") in inbox_ids]
+
+    # Aggregate by sender (case-insensitive); track latest email date per sender
+    sender_map: dict = {}  # key: lower_email, value: {from_email, from_name, count, last_date}
+    for c in inbox_contents:
+        fe = (c.get("from_email") or "").strip()
+        fn = (c.get("from_name") or "").strip()
+        key = fe.lower() if fe else "__unknown__"
+        if key not in sender_map:
+            sender_map[key] = {"from_email": fe or "(unknown)", "from_name": fn or fe or "(unknown)", "count": 0, "last_date": None}
+        sender_map[key]["count"] += 1
+        date_val = c.get("date") or ""
+        if date_val:
+            current = sender_map[key]["last_date"]
+            sender_map[key]["last_date"] = max(current or "", date_val) if current else date_val
+
+    senders = sorted(sender_map.values(), key=lambda x: -x["count"])
+    return {
+        "unique_senders_count": len(senders),
+        "senders": senders,
+    }
+
+
 def list_emails(
     user_id: str,
     mailbox_id: str | None = None,
     category: str | None = None,
     unread_only: bool = False,
+    from_email: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> list[dict]:
-    # Step 1: Query MongoDB for IDs + mutable state (filtering & pagination)
     query: dict = {"user_id": user_id, "archived": False, "trashed": False}
     if mailbox_id:
         query["mailbox_id"] = mailbox_id
@@ -83,6 +122,20 @@ def list_emails(
         {"snoozed_until": None},
         {"snoozed_until": {"$lte": now}},
     ]
+
+    # Pre-filter email IDs from Qdrant when filtering by category or sender
+    id_filter: list[str] | None = None
+    if category:
+        qdrant_emails = scroll_all_chunk0(user_id, mailbox_id=mailbox_id, category=category)
+        id_filter = [e["email_id"] for e in qdrant_emails if e.get("email_id")]
+    sender_email = (from_email or "").strip()
+    if sender_email:
+        sender_ids = get_email_ids_by_sender(user_id, sender_email, mailbox_id)
+        id_filter = sender_ids if id_filter is None else [eid for eid in id_filter if eid in set(sender_ids)]
+    if id_filter is not None:
+        if not id_filter:
+            return []
+        query["_id"] = {"$in": id_filter}
 
     cursor = (
         email_metadata_col()
@@ -96,20 +149,12 @@ def list_emails(
         return []
 
     email_ids = [str(d["_id"]) for d in mongo_docs]
-
-    # Step 2: Batch-fetch content from Qdrant (chunk_index=0)
     content_map = get_emails_content_batch(email_ids, user_id)
 
-    # Step 3: Merge MongoDB mutable state + Qdrant content
     results = []
     for doc in mongo_docs:
         eid = str(doc["_id"])
         content = content_map.get(eid, {})
-
-        # Apply category filter (category is in Qdrant, not MongoDB)
-        if category and content.get("category") != category:
-            continue
-
         results.append(_merge_email(doc, content))
 
     return results

@@ -161,15 +161,17 @@ def _exec_set_reminder(user_id: str, action: dict) -> dict:
     hours = int(action.get("hours", 24))
     if hours < 0:
         hours = 24
-    due = datetime.now(timezone.utc) + timedelta(hours=hours)
+    now = datetime.now(timezone.utc)
+    due = now + timedelta(hours=hours)
     follow_ups_col().insert_one({
         "user_id": user_id,
         "email_id": action.get("email_id", ""),
         "due_date": due,
         "status": "pending",
         "auto_reminder_sent": False,
-        "suggested_action": action.get("note", action.get("description", "")),
-        "created_at": datetime.now(timezone.utc),
+        "days_waiting": 0,
+        "created_at": now,
+        "updated_at": now,
     })
     return {"details": f"Reminder set for {due.strftime('%Y-%m-%d %H:%M UTC')}"}
 

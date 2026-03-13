@@ -94,7 +94,7 @@ def agent_chat(
     key_contacts = profile.get("key_contacts", [])
     contacts_lookup = [
         {"name": c.get("name", ""), "email": c.get("email", "")}
-        for c in key_contacts[:15]
+        for c in key_contacts
         if c.get("email")
     ]
 
@@ -155,10 +155,18 @@ def agent_chat(
         "may contain errors — misspelled names, broken email addresses (spaces "
         "in emails, 'at' instead of '@', 'dot' instead of '.'), or garbled "
         "words. Use context and the user's known contacts from their profile to "
-        "infer the correct names, email addresses, and intent. When generating "
-        "a send_email, send_reply, or forward_email action, always confirm the "
-        "exact recipient or intent with the user before sending. If a user says "
-        "a name (e.g. 'send email to Ahmed'), look up their email from KEY CONTACTS below."
+        "infer the correct names, email addresses, and intent. If a user says "
+        "a name (e.g. 'send email to Ahmed'), look up their email from KEY CONTACTS below.\n"
+        "12. RECIPIENT RESOLUTION: **If multiple contacts share the same or similar name, "
+        "you MUST list ALL matching contacts with their email addresses and ask the user "
+        "to pick the correct one. NEVER auto-pick one silently.**\n"
+        "13. SENDER CONFIRMATION: Before emitting any send_email, send_reply, or forward_email "
+        "action, you MUST clearly state:\n"
+        "   - **From**: which mailbox/email address the email will be sent from\n"
+        "   - **To**: the recipient's full email address\n"
+        "   - **Subject** and a brief summary of the body\n"
+        "   If the user has multiple mailboxes, ask which one to send from. "
+        "Only emit the action block AFTER the user confirms these details or says 'send it'."
     )
 
     messages = [{"role": "system", "content": system_prompt}]

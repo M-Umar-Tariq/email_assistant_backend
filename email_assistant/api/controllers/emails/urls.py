@@ -4,6 +4,7 @@ from . import views
 urlpatterns = [
     path("", views.email_list, name="email-list"),
     path("stats/", views.email_stats, name="email-stats"),
+    path("unique-senders/", views.email_unique_senders, name="email-unique-senders"),
     path("send/", views.email_send, name="email-send"),
     path("delete-all/", views.email_delete_all, name="email-delete-all"),
     path("<str:email_id>/", views.email_detail, name="email-detail"),

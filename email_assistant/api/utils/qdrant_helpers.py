@@ -104,6 +104,19 @@ def scroll_all_chunk0(
     return [_payload_to_content(p.payload) for p in all_points]
 
 
+def get_email_ids_by_sender(
+    user_id: str,
+    from_email: str,
+    mailbox_id: str | None = None,
+) -> list[str]:
+    """Return email_ids for inbox emails from the given sender (case-insensitive)."""
+    if not (from_email or "").strip():
+        return []
+    all_content = scroll_all_chunk0(user_id, mailbox_id=mailbox_id)
+    target = from_email.strip().lower()
+    return [c["email_id"] for c in all_content if c.get("email_id") and (c.get("from_email") or "").strip().lower() == target]
+
+
 def _payload_to_content(payload: dict) -> dict:
     """Convert a Qdrant payload into a clean content dictionary."""
     to_raw = payload.get("to", "[]")

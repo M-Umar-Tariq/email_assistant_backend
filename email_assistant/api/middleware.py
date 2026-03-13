@@ -47,6 +47,11 @@ def decode_token(token: str) -> dict:
     return jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=["HS256"])
 
 
+def verify_refresh_token(token: str) -> bool:
+    """Check if the refresh token exists in the database (not blacklisted)."""
+    return refresh_tokens_col().find_one({"token": token}) is not None
+
+
 def blacklist_refresh_token(token: str):
     refresh_tokens_col().delete_one({"token": token})
 

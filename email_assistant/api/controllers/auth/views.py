@@ -11,6 +11,7 @@ from api.middleware import (
     create_access_token,
     create_refresh_token,
     decode_token,
+    verify_refresh_token,
     blacklist_refresh_token,
     jwt_required,
 )
@@ -58,6 +59,10 @@ def refresh(request):
     token = request.data.get("refresh_token", "")
     if not token:
         return Response({"error": "refresh_token required"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not verify_refresh_token(token):
+        return Response({"error": "Invalid or expired refresh token"}, status=status.HTTP_401_UNAUTHORIZED)
+
     try:
         payload = decode_token(token)
     except Exception:

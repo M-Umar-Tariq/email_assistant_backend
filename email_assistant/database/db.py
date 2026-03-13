@@ -15,7 +15,7 @@ from qdrant_client.models import Distance, VectorParams
 
 @lru_cache(maxsize=1)
 def _mongo_client() -> MongoClient:
-    return MongoClient(settings.MONGODB_URI)
+    return MongoClient(settings.MONGODB_URI, tz_aware=True)
 
 
 def get_db():

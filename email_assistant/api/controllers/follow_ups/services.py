@@ -14,7 +14,6 @@ def create_follow_up(user_id: str, data: dict) -> dict:
         "due_date": data["due_date"],
         "status": "pending",
         "auto_reminder_sent": False,
-        "suggested_action": data.get("suggested_action", ""),
         "days_waiting": 0,
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc),
@@ -29,14 +28,20 @@ def list_follow_ups(user_id: str, status_filter: str | None = None) -> list[dict
     if status_filter and status_filter != "all":
         query["status"] = status_filter
     cursor = follow_ups_col().find(query).sort("due_date", 1)
+    now = datetime.now(timezone.utc)
     results = []
     for doc in cursor:
         try:
             if doc.get("status") not in ("completed", "snoozed"):
                 due = doc.get("due_date")
-                if isinstance(due, datetime) and due < datetime.now(timezone.utc):
-                    follow_ups_col().update_one({"_id": doc["_id"]}, {"$set": {"status": "overdue", "updated_at": datetime.now(timezone.utc)}})
+                if isinstance(due, datetime) and due < now:
+                    days_waiting = max((now - due).days, 1)
+                    follow_ups_col().update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"status": "overdue", "days_waiting": days_waiting, "updated_at": now}},
+                    )
                     doc["status"] = "overdue"
+                    doc["days_waiting"] = days_waiting
         except Exception:
             pass
         content = get_email_content(doc["email_id"], user_id)
@@ -98,7 +103,7 @@ def auto_detect_today_follow_ups(user_id: str) -> dict:
     if items:
         payload = json.dumps({"emails": items})
         res = chat_json(
-            "Decide follow-ups. Return JSON: {\"decisions\": [{\"id\":\"...\",\"need\":true|false,\"due_hours\":number,\"note\":\"...\"}]}",
+            "Decide follow-ups. Return JSON: {\"decisions\": [{\"id\":\"...\",\"need\":true|false,\"due_hours\":number}]}",
             f"Evaluate and return decisions for these emails:\n{payload}",
             temperature=0.1,
         )
@@ -125,7 +130,6 @@ def auto_detect_today_follow_ups(user_id: str) -> dict:
             "due_date": due_date,
             "status": "pending",
             "auto_reminder_sent": False,
-            "suggested_action": dec.get("note", ""),
             "days_waiting": 0,
             "created_at": now,
             "updated_at": now,
@@ -143,7 +147,6 @@ def _serialize(doc: dict) -> dict:
         "due_date": doc["due_date"],
         "status": doc["status"],
         "auto_reminder_sent": doc.get("auto_reminder_sent", False),
-        "suggested_action": doc.get("suggested_action", ""),
         "days_waiting": doc.get("days_waiting", 0),
         "created_at": doc.get("created_at"),
     }
