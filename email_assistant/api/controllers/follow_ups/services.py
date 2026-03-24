@@ -77,13 +77,15 @@ def delete_follow_up(user_id: str, follow_up_id: str) -> bool:
 def auto_detect_today_follow_ups(user_id: str) -> dict:
     now = datetime.now(timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    q = {
-        "user_id": user_id,
-        "archived": False,
-        "trashed": False,
-        "date": {"$gte": start},
-        "$or": [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}],
-    }
+    today_date_filter = {"$or": [
+        {"original_date": {"$gte": start}},
+        {"original_date": None, "date": {"$gte": start}},
+    ]}
+    q = {"$and": [
+        {"user_id": user_id, "archived": False, "trashed": False},
+        today_date_filter,
+        {"$or": [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}]},
+    ]}
     docs = list(email_metadata_col().find(q).limit(200))
     items: list[dict] = []
     for d in docs:

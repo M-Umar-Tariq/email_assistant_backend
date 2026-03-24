@@ -6,6 +6,7 @@ Content from Qdrant; mutable state from MongoDB.
 import json
 import re
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -48,10 +49,18 @@ _LATEST_EMAIL_PATTERN = re.compile(
 )
 
 
-def _detect_time_range(query: str) -> tuple[str | None, datetime | None, datetime | None]:
-    """Return (range_label, start_dt, end_dt) or (None, None, None)."""
-    now = datetime.now(timezone.utc)
+def _detect_time_range(query: str, tz: ZoneInfo | None = None) -> tuple[str | None, datetime | None, datetime | None]:
+    """Return (range_label, start_dt, end_dt) or (None, None, None).
+    All boundaries are computed in the user's local timezone, then converted
+    to UTC so MongoDB queries (which store dates in UTC) work correctly."""
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(tz) if tz else now_utc
     q_lower = query.lower()
+
+    def _local_midnight(dt: datetime) -> datetime:
+        """Midnight of the given day in user's timezone, returned as UTC."""
+        midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.astimezone(timezone.utc) if tz else midnight
 
     for pattern, label in _TIME_PATTERNS:
         m = re.search(pattern, q_lower)
@@ -59,34 +68,34 @@ def _detect_time_range(query: str) -> tuple[str | None, datetime | None, datetim
             continue
 
         if label == "today":
-            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            return label, start, now
+            start = _local_midnight(now_local)
+            return label, start, now_utc
         if label == "yesterday":
-            start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            start = _local_midnight(now_local - timedelta(days=1))
+            end = _local_midnight(now_local)
             return label, start, end
         if label == "this_week":
-            start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-            return label, start, now
+            start = _local_midnight(now_local - timedelta(days=now_local.weekday()))
+            return label, start, now_utc
         if label == "last_week":
-            this_monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+            this_monday = _local_midnight(now_local - timedelta(days=now_local.weekday()))
             start = this_monday - timedelta(days=7)
             return label, start, this_monday
         if label == "this_month":
-            start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            return label, start, now
+            start = _local_midnight(now_local.replace(day=1))
+            return label, start, now_utc
         if label == "last_month":
-            first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            first_this = _local_midnight(now_local.replace(day=1))
             last_month_end = first_this - timedelta(seconds=1)
-            start = last_month_end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            start = _local_midnight(last_month_end.astimezone(tz if tz else timezone.utc).replace(day=1))
             return label, start, first_this
         if label == "last_n_days":
             days = int(m.group(1))
-            start = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
-            return label, start, now
+            start = _local_midnight(now_local - timedelta(days=days))
+            return label, start, now_utc
         if label == "this_year":
-            start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-            return label, start, now
+            start = _local_midnight(now_local.replace(month=1, day=1))
+            return label, start, now_utc
         if label == "all":
             return label, None, None
 
@@ -99,7 +108,31 @@ def _is_broad_query(query: str) -> bool:
 
 # ── Context building ──────────────────────────────────────────────────────────
 
-def _build_email_block_full(content: dict, meta: dict | None) -> str:
+def _format_date(meta: dict | None, content: dict, tz: ZoneInfo | None = None) -> str:
+    """Return a human-readable date string using MongoDB date (same source as inbox).
+    Falls back to Qdrant ISO string if MongoDB date is unavailable."""
+    dt = None
+    if meta:
+        dt = meta.get("original_date") or meta.get("date")
+    if dt and isinstance(dt, datetime):
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if tz:
+            dt = dt.astimezone(tz)
+        return dt.strftime("%B %d, %Y %I:%M %p")
+    date_str = content.get("date", "")
+    if date_str:
+        try:
+            dt = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+            if tz:
+                dt = dt.astimezone(tz)
+            return dt.strftime("%B %d, %Y %I:%M %p")
+        except (ValueError, TypeError):
+            return date_str
+    return "unknown"
+
+
+def _build_email_block_full(content: dict, meta: dict | None, tz: ZoneInfo | None = None) -> str:
     """Rich context block for a single email — used when we have few emails."""
     parts = [f"**Email: {content.get('subject', '(no subject)')}**"]
     parts.append(f"From: {content.get('from_name', '')} <{content.get('from_email', '')}>")
@@ -111,7 +144,7 @@ def _build_email_block_full(content: dict, meta: dict | None) -> str:
         )
         parts.append(f"To: {to_str}")
 
-    parts.append(f"Date: {content.get('date', 'unknown')}")
+    parts.append(f"Date: {_format_date(meta, content, tz)}")
 
     tags = []
     if content.get("priority") == "high":
@@ -139,7 +172,7 @@ def _build_email_block_full(content: dict, meta: dict | None) -> str:
     return "\n".join(parts)
 
 
-def _build_email_block_compact(content: dict, meta: dict | None) -> str:
+def _build_email_block_compact(content: dict, meta: dict | None, tz: ZoneInfo | None = None) -> str:
     """Compact context block — used when we have many emails to fit more in context."""
     tags = []
     if content.get("priority") == "high":
@@ -156,7 +189,7 @@ def _build_email_block_compact(content: dict, meta: dict | None) -> str:
     return (
         f"• **{content.get('subject', '(no subject)')}**{tag_str}\n"
         f"  From: {content.get('from_name', '')} <{content.get('from_email', '')}> | "
-        f"Date: {content.get('date', '?')}\n"
+        f"Date: {_format_date(meta, content, tz)}\n"
         f"  {preview[:300]}"
     )
 
@@ -179,7 +212,10 @@ def _fetch_emails_by_date(
             date_filter["$gte"] = start
         if end:
             date_filter["$lte"] = end
-        query_filter["date"] = date_filter
+        query_filter["$or"] = [
+            {"original_date": date_filter},
+            {"original_date": None, "date": date_filter},
+        ]
     if mailbox_id:
         query_filter["mailbox_id"] = mailbox_id
 
@@ -282,8 +318,15 @@ def _fetch_emails_by_vector(
 
 # ── Main ask function ─────────────────────────────────────────────────────────
 
-def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list | None = None) -> dict:
-    time_label, start_dt, end_dt = _detect_time_range(query)
+def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list | None = None, user_tz: str | None = None) -> dict:
+    tz: ZoneInfo | None = None
+    if user_tz:
+        try:
+            tz = ZoneInfo(user_tz)
+        except (KeyError, Exception):
+            pass
+
+    time_label, start_dt, end_dt = _detect_time_range(query, tz)
     broad = _is_broad_query(query)
     want_latest = bool(_LATEST_EMAIL_PATTERN.search(query))
 
@@ -308,9 +351,9 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
     sources = []
     for i, (c, m) in enumerate(zip(contents, metas)):
         if use_compact and i >= FULL_CUTOFF:
-            context_blocks.append(_build_email_block_compact(c, m))
+            context_blocks.append(_build_email_block_compact(c, m, tz))
         else:
-            context_blocks.append(_build_email_block_full(c, m))
+            context_blocks.append(_build_email_block_full(c, m, tz))
         sources.append({
             "email_id": c.get("email_id", ""),
             "subject": c.get("subject", ""),
@@ -318,7 +361,12 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
 
     separator = "\n\n" if use_compact else "\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
     context = separator.join(context_blocks)
-    now_str = datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M UTC")
+    now = datetime.now(timezone.utc)
+    if tz:
+        now_local = now.astimezone(tz)
+        now_str = now_local.strftime(f"%A, %B %d, %Y %H:%M ({user_tz})")
+    else:
+        now_str = now.strftime("%A, %B %d, %Y %H:%M UTC")
 
     range_note = ""
     range_note += (

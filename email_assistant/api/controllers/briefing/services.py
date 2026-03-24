@@ -13,10 +13,14 @@ def get_briefing(user_id: str) -> dict:
         "user_id": user_id, "read": False, "archived": False, "trashed": False,
     })
 
-    # Get today's emails from MongoDB
+    # Get today's emails from MongoDB (use original_date to avoid
+    # thread-bumped old emails appearing as today's)
     today_docs = list(email_metadata_col().find({
         "user_id": user_id,
-        "date": {"$gte": start_of_day},
+        "$or": [
+            {"original_date": {"$gte": start_of_day}},
+            {"original_date": None, "date": {"$gte": start_of_day}},
+        ],
         "archived": False,
         "trashed": False,
     }).sort("date", -1).limit(30))

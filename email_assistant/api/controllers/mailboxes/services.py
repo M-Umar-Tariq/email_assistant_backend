@@ -387,6 +387,8 @@ def sync_mailbox(
                         if parent_dt and not parent_dt.tzinfo:
                             parent_dt = parent_dt.replace(tzinfo=timezone.utc)
                         set_fields: dict = {"read": False}
+                        if not parent.get("original_date") and parent_dt:
+                            set_fields["original_date"] = parent_dt
                         if not parent_dt or (reply_dt and reply_dt > parent_dt):
                             set_fields["date"] = reply_dt
                         update_ops["$set"] = set_fields
@@ -478,6 +480,7 @@ def sync_mailbox(
                         "from_name": email_data.get("from_name", ""),
                         "from_email": email_data.get("from_email", ""),
                         "date": email_data["date"],
+                        "original_date": email_data["date"],
                         "read": email_data["read"],
                         "starred": email_data["starred"],
                         "replied_at": email_data["date"].isoformat() if email_data["replied"] and email_data["date"] else None,
@@ -786,12 +789,14 @@ def _parse_address(addr_str: str) -> tuple[str, str]:
     return "", addr_str.strip()
 
 
-def _parse_date(date_str: str) -> datetime:
+def _parse_date(date_str: str) -> datetime | None:
     from email.utils import parsedate_to_datetime
+    if not date_str:
+        return None
     try:
         return parsedate_to_datetime(date_str)
     except Exception:
-        return datetime.now(timezone.utc)
+        return None
 
 
 def _delete_qdrant_chunks_for_mailbox(user_id: str, mailbox_id: str):

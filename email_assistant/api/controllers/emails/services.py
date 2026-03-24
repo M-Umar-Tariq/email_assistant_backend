@@ -23,7 +23,11 @@ def email_stats(user_id: str) -> dict:
     snooze_filter = {"$or": [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}]}
 
     start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_q = {**base_q, **snooze_filter, "date": {"$gte": start_of_today}}
+    today_date_filter = {"$or": [
+        {"original_date": {"$gte": start_of_today}},
+        {"original_date": None, "date": {"$gte": start_of_today}},
+    ]}
+    today_q = {"$and": [base_q, snooze_filter, today_date_filter]}
     all_q = {**base_q, **snooze_filter}
 
     col = email_metadata_col()
