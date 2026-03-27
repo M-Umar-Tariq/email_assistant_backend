@@ -1,1 +1,56 @@
+name: Deploy to Windows VPS
 
+on:
+  push:
+    branches:
+      - main  # Triggers the deployment when pushing to the 'main' branch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest  # GitHub Actions will run this job on an Ubuntu runner
+
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v2  # This checks out the code from the GitHub repo
+
+      - name: SSH to VPS and deploy code
+        uses: appleboy/ssh-action@v0.1.1  # This action helps to SSH into your Windows VPS
+        with:
+          host: ${{ secrets.VPS_HOST }}  # Your VPS IP (added as a GitHub secret)
+          username: ${{ secrets.VPS_USER }}  # VPS username (e.g., Administrator)
+          key: ${{ secrets.VPS_SSH_KEY }}  # The private SSH key for authentication (added as a GitHub secret)
+          script: |
+            # Navigate to your project directory
+            cd C:/Users/Administrator/Desktop/apps/email-assistant
+
+            # Pull the latest code from GitHub
+            git pull origin main
+
+            # ================================
+            # Deploy Backend (Django)
+            # ================================
+            cd backend/email_assistant
+
+            # Activate the virtual environment
+            .\.venv\Scripts\Activate.ps1
+
+            # Install any dependencies
+            pip install -r requirements.txt
+
+            # Restart the Django server by killing the existing process and starting a new one
+            Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Process python -ArgumentList "manage.py runserver 0.0.0.0:8000"
+
+            # ================================
+            # Deploy Frontend (Next.js)
+            # ================================
+            cd ..\..\frontend
+
+            # Install dependencies
+            npm install
+
+            # Build the frontend
+            npm run build
+
+            # Restart Next.js using PM2
+            pm2 restart all
