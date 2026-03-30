@@ -3,35 +3,23 @@ name: Deploy Backend to VPS
 on:
   push:
     branches:
-      - main  # Deploy when there's a push to 'main' branch in the backend repo
+      - main
+  workflow_dispatch:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
-      - name: Checkout backend repository
-        uses: actions/checkout@v2
-
-      - name: SSH to VPS and deploy backend
-        uses: appleboy/ssh-action@v0.1.1
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            # Navigate to the backend directory
-            cd C:/Users/Administrator/Desktop/apps/email-assistant/backend/email_assistant
-
-            # Pull the latest changes
-            git pull origin main
-
-            # Activate the virtual environment
-            .\.venv\Scripts\Activate.ps1
-
-            # Install dependencies
-            pip install -r requirements.txt
-
-            # Restart the Django server
-            Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force
-            Start-Process python -ArgumentList "manage.py runserver 0.0.0.0:8000"
+      - name: Deploy backend on VPS
+        shell: powershell
+        run: |
+          Set-Location C:\Users\Administrator\Desktop\apps\email-assistant\backend\email_assistant
+          git fetch origin
+          git reset --hard origin/main
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+          .\.venv\Scripts\python.exe -m pip install waitress
+          .\.venv\Scripts\python.exe manage.py migrate
+          .\.venv\Scripts\python.exe manage.py collectstatic --noinput
+          pm2 restart email-assistant-backend
+          pm2 save
