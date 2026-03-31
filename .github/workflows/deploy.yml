@@ -1,36 +1,52 @@
-- name: Deploy backend on VPS
-  shell: powershell
-  run: |
-    $ErrorActionPreference = "Stop"
+name: Deploy Backend to VPS
 
-    git config --global --add safe.directory C:/apps/email-assistant/backend/email_assistant_backend
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
 
-    Set-Location C:\apps\email-assistant\backend\email_assistant_backend\email_assistant
+jobs:
+  deploy:
+    runs-on: [self-hosted, Windows, X64]
 
-    $pm2 = "C:\Users\Administrator\AppData\Roaming\npm\pm2.cmd"
+    steps:
+      - name: Deploy backend on VPS
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
 
-    if (Test-Path $pm2) {
-      & $pm2 stop email-assistant-backend
-      if ($LASTEXITCODE -ne 0) { Write-Host "PM2 process was not stopped, continuing..." }
-    }
+          git config --global --add safe.directory C:/apps/email-assistant/backend/email_assistant_backend
 
-    Get-ChildItem -Recurse -Include *.pyc | Remove-Item -Force -ErrorAction SilentlyContinue
-    Get-ChildItem -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Set-Location C:\apps\email-assistant\backend\email_assistant_backend\email_assistant
 
-    git fetch origin
-    git reset --hard origin/main
+          $pm2 = "C:\Users\Administrator\AppData\Roaming\npm\pm2.cmd"
 
-    $python = ".\.venv\Scripts\python.exe"
-    & $python -m pip install --upgrade pip
-    & $python -m pip install -r requirements.txt
-    & $python -m pip install waitress
+          if (Test-Path $pm2) {
+            & $pm2 stop email-assistant-backend
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "PM2 process was not stopped, continuing..."
+            }
+          }
 
-    & $python manage.py migrate
-    & $python manage.py collectstatic --noinput
+          Get-ChildItem -Recurse -Include *.pyc | Remove-Item -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-    if (Test-Path $pm2) {
-      & $pm2 restart email-assistant-backend
-      & $pm2 save
-    } else {
-      throw "PM2 not found at $pm2"
-    }
+          git fetch origin
+          git reset --hard origin/main
+
+          $python = ".\.venv\Scripts\python.exe"
+
+          & $python -m pip install --upgrade pip
+          & $python -m pip install -r requirements.txt
+          & $python -m pip install waitress
+
+          & $python manage.py migrate
+          & $python manage.py collectstatic --noinput
+
+          if (Test-Path $pm2) {
+            & $pm2 restart email-assistant-backend
+            & $pm2 save
+          } else {
+            throw "PM2 not found at $pm2"
+          }
