@@ -14,7 +14,8 @@ jobs:
       - name: Deploy backend on VPS
         shell: powershell
         run: |
-          Set-Location C:\Users\Administrator\Desktop\apps\email-assistant\backend\email_assistant
+          $ErrorActionPreference = "Stop"
+          Set-Location C:\apps\email-assistant\backend\email_assistant_backend\email_assistant
           git fetch origin
           git reset --hard origin/main
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
