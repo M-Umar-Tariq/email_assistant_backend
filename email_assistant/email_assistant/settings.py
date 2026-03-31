@@ -184,3 +184,5 @@ OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "nova")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")
+
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
