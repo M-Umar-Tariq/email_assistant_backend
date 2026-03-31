@@ -15,40 +15,30 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $false
 
           git config --global --add safe.directory C:/apps/email-assistant/backend/email_assistant_backend
 
           Set-Location C:\apps\email-assistant\backend\email_assistant_backend\email_assistant
 
-          # Ensure PM2 is available for the runner account
-          npx --yes pm2 -v | Out-Null
-
-          # Stop app safely
-          npx --yes pm2 stop email-assistant-backend 2>$null
+          pm2 stop email-assistant-backend
           if ($LASTEXITCODE -ne 0) {
             Write-Host "PM2 stop skipped..."
           }
 
-          # Clean cache
           Get-ChildItem -Recurse -Include *.pyc | Remove-Item -Force -ErrorAction SilentlyContinue
           Get-ChildItem -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-          # Pull latest code
           git fetch origin
           git reset --hard origin/main
 
           $python = ".\.venv\Scripts\python.exe"
 
-          # Install dependencies
           & $python -m pip install --upgrade pip
           & $python -m pip install -r requirements.txt
           & $python -m pip install waitress
 
-          # Django commands
           & $python manage.py migrate
           & $python manage.py collectstatic --noinput
 
-          # Restart app
-          npx --yes pm2 restart email-assistant-backend
-          npx --yes pm2 save
+          pm2 restart email-assistant-backend
+          pm2 save
