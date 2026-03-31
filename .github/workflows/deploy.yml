@@ -15,13 +15,26 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+
+          # ✅ FIX 1: Git safe directory (CRITICAL)
+          git config --global --add safe.directory C:/apps/email-assistant/backend/email_assistant_backend
+
+          # Go to project
           Set-Location C:\apps\email-assistant\backend\email_assistant_backend\email_assistant
+
+          # Pull latest code
           git fetch origin
           git reset --hard origin/main
+
+          # Install dependencies
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
           .\.venv\Scripts\python.exe -m pip install -r requirements.txt
           .\.venv\Scripts\python.exe -m pip install waitress
+
+          # Django commands
           .\.venv\Scripts\python.exe manage.py migrate
           .\.venv\Scripts\python.exe manage.py collectstatic --noinput
-          pm2 restart email-assistant-backend
-          pm2 save
+
+          # ✅ FIX 2: Use FULL PM2 PATH (CRITICAL)
+          & "C:\Users\Administrator\AppData\Roaming\npm\pm2.cmd" restart email-assistant-backend
+          & "C:\Users\Administrator\AppData\Roaming\npm\pm2.cmd" save
