@@ -1,58 +1,36 @@
-name: Deploy Backend to VPS
+- name: Deploy backend on VPS
+  shell: powershell
+  run: |
+    $ErrorActionPreference = "Stop"
 
-on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+    git config --global --add safe.directory C:/apps/email-assistant/backend/email_assistant_backend
 
-jobs:
-  deploy:
-    runs-on: [self-hosted, Windows, X64]
+    Set-Location C:\apps\email-assistant\backend\email_assistant_backend\email_assistant
 
-    steps:
-      - name: Deploy backend on VPS
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
+    $pm2 = "C:\Users\Administrator\AppData\Roaming\npm\pm2.cmd"
 
-          # ✅ Fix Git ownership
-          git config --global --add safe.directory C:/apps/email-assistant/backend/email_assistant_backend
+    if (Test-Path $pm2) {
+      & $pm2 stop email-assistant-backend
+      if ($LASTEXITCODE -ne 0) { Write-Host "PM2 process was not stopped, continuing..." }
+    }
 
-          # Go to project
-          Set-Location C:\apps\email-assistant\backend\email_assistant_backend\email_assistant
+    Get-ChildItem -Recurse -Include *.pyc | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-          # ✅ CRITICAL: Stop running app before pulling (fix file lock)
-          taskkill /F /IM python.exe /T 2>$null
-          taskkill /F /IM waitress-serve.exe /T 2>$null
+    git fetch origin
+    git reset --hard origin/main
 
-          # Pull latest code
-          git fetch origin
-          git reset --hard origin/main
+    $python = ".\.venv\Scripts\python.exe"
+    & $python -m pip install --upgrade pip
+    & $python -m pip install -r requirements.txt
+    & $python -m pip install waitress
 
-          # Clean cache files (fix unlink errors)
-          Get-ChildItem -Recurse -Include *.pyc | Remove-Item -Force -ErrorAction SilentlyContinue
-          Get-ChildItem -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    & $python manage.py migrate
+    & $python manage.py collectstatic --noinput
 
-          # Use venv python (NO SYSTEM PYTHON)
-          $python = ".\.venv\Scripts\python.exe"
-
-          # Install dependencies
-          & $python -m pip install --upgrade pip
-          & $python -m pip install -r requirements.txt
-          & $python -m pip install waitress
-
-          # Django commands
-          & $python manage.py migrate
-          & $python manage.py collectstatic --noinput
-
-          # ✅ Start PM2 using absolute path (safe fallback)
-          $pm2 = "C:\Users\Administrator\AppData\Roaming\npm\pm2.cmd"
-
-          if (Test-Path $pm2) {
-            & $pm2 restart email-assistant-backend
-            & $pm2 save
-          } else {
-            Write-Host "PM2 not found, starting manually..."
-            Start-Process -NoNewWindow $python -ArgumentList "manage.py runserver 0.0.0.0:8000"
-          }
+    if (Test-Path $pm2) {
+      & $pm2 restart email-assistant-backend
+      & $pm2 save
+    } else {
+      throw "PM2 not found at $pm2"
+    }
