@@ -16,25 +16,43 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # ✅ FIX 1: Git safe directory (CRITICAL)
+          # ✅ Fix Git ownership
           git config --global --add safe.directory C:/apps/email-assistant/backend/email_assistant_backend
 
           # Go to project
           Set-Location C:\apps\email-assistant\backend\email_assistant_backend\email_assistant
 
+          # ✅ CRITICAL: Stop running app before pulling (fix file lock)
+          taskkill /F /IM python.exe /T 2>$null
+          taskkill /F /IM waitress-serve.exe /T 2>$null
+
           # Pull latest code
           git fetch origin
           git reset --hard origin/main
 
+          # Clean cache files (fix unlink errors)
+          Get-ChildItem -Recurse -Include *.pyc | Remove-Item -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+          # Use venv python (NO SYSTEM PYTHON)
+          $python = ".\.venv\Scripts\python.exe"
+
           # Install dependencies
-          .\.venv\Scripts\python.exe -m pip install --upgrade pip
-          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-          .\.venv\Scripts\python.exe -m pip install waitress
+          & $python -m pip install --upgrade pip
+          & $python -m pip install -r requirements.txt
+          & $python -m pip install waitress
 
           # Django commands
-          .\.venv\Scripts\python.exe manage.py migrate
-          .\.venv\Scripts\python.exe manage.py collectstatic --noinput
+          & $python manage.py migrate
+          & $python manage.py collectstatic --noinput
 
-          # ✅ FIX 2: Use FULL PM2 PATH (CRITICAL)
-          & "C:\Users\Administrator\AppData\Roaming\npm\pm2.cmd" restart email-assistant-backend
-          & "C:\Users\Administrator\AppData\Roaming\npm\pm2.cmd" save
+          # ✅ Start PM2 using absolute path (safe fallback)
+          $pm2 = "C:\Users\Administrator\AppData\Roaming\npm\pm2.cmd"
+
+          if (Test-Path $pm2) {
+            & $pm2 restart email-assistant-backend
+            & $pm2 save
+          } else {
+            Write-Host "PM2 not found, starting manually..."
+            Start-Process -NoNewWindow $python -ArgumentList "manage.py runserver 0.0.0.0:8000"
+          }
