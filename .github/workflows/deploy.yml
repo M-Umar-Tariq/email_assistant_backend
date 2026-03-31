@@ -20,33 +20,29 @@ jobs:
 
           Set-Location C:\apps\email-assistant\backend\email_assistant_backend\email_assistant
 
-          $pm2 = "C:\Users\Administrator\AppData\Roaming\npm\pm2.cmd"
+          # Stop app safely (ignore errors)
+          npx pm2 stop email-assistant-backend 2>$null
+          if ($LASTEXITCODE -ne 0) { Write-Host "PM2 stop skipped..." }
 
-          if (Test-Path $pm2) {
-            & $pm2 stop email-assistant-backend
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "PM2 process was not stopped, continuing..."
-            }
-          }
-
+          # Clean cache
           Get-ChildItem -Recurse -Include *.pyc | Remove-Item -Force -ErrorAction SilentlyContinue
           Get-ChildItem -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
+          # Pull latest code
           git fetch origin
           git reset --hard origin/main
 
           $python = ".\.venv\Scripts\python.exe"
 
+          # Install dependencies
           & $python -m pip install --upgrade pip
           & $python -m pip install -r requirements.txt
           & $python -m pip install waitress
 
+          # Django
           & $python manage.py migrate
           & $python manage.py collectstatic --noinput
 
-          if (Test-Path $pm2) {
-            & $pm2 restart email-assistant-backend
-            & $pm2 save
-          } else {
-            throw "PM2 not found at $pm2"
-          }
+          # Restart app
+          npx pm2 restart email-assistant-backend
+          npx pm2 save
