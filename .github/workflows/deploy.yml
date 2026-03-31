@@ -8,15 +8,16 @@ on:
 
 jobs:
   deploy:
-    runs-on: self-hosted
+    runs-on: [self-hosted, Windows, X64]
 
     steps:
       - name: Deploy backend on VPS
         shell: powershell
         run: |
-          Set-Location Set-Location C:\apps\email-assistant\backend\email_assistant
+          Set-Location C:\Users\Administrator\Desktop\apps\email-assistant\backend\email_assistant
           git fetch origin
           git reset --hard origin/main
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
           .\.venv\Scripts\python.exe -m pip install -r requirements.txt
           .\.venv\Scripts\python.exe -m pip install waitress
           .\.venv\Scripts\python.exe manage.py migrate
