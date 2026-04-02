@@ -43,7 +43,7 @@ def home(request):
         <div class="container">
             <h1>Welcome to Email Assistant Backend API</h1>
             <p>Your backend server is running successfully.</p>
-            <p>Developed by Umar Tariq with love😀</p>
+            <p>Developed by Muhammad Umar Tariq with love 😀</p>
             <div class="tag">Django API Server</div>
         </div>
     </body>
