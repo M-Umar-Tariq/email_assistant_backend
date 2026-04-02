@@ -20,9 +20,7 @@ jobs:
 
           Set-Location C:\apps\email-assistant\backend\email_assistant_backend\email_assistant
 
-          $pm2 = "C:\Users\Administrator\AppData\Roaming\npm\pm2.cmd"
-
-          & $pm2 stop email-assistant-backend
+          pm2 stop email-assistant-backend
           if ($LASTEXITCODE -ne 0) {
             Write-Host "PM2 stop skipped..."
           }
@@ -42,5 +40,5 @@ jobs:
           & $python manage.py migrate
           & $python manage.py collectstatic --noinput
 
-          & $pm2 restart email-assistant-backend
-          & $pm2 save
+          pm2 restart email-assistant-backend
+          pm2 save
