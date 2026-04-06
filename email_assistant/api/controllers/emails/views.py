@@ -41,6 +41,16 @@ def email_unique_senders(request):
 
 @api_view(["GET"])
 @jwt_required
+def email_folder_counts(request):
+    data = services.folder_counts(
+        user_id=request.user_id,
+        mailbox_id=request.query_params.get("mailbox_id") or None,
+    )
+    return Response(data)
+
+
+@api_view(["GET"])
+@jwt_required
 def email_list(request):
     data = services.list_emails(
         user_id=request.user_id,
@@ -48,6 +58,8 @@ def email_list(request):
         category=request.query_params.get("category"),
         unread_only=request.query_params.get("unread_only", "").lower() == "true",
         from_email=request.query_params.get("from_email") or None,
+        label=request.query_params.get("label") or None,
+        folder=request.query_params.get("folder") or None,
         limit=int(request.query_params.get("limit", 50)),
         offset=int(request.query_params.get("offset", 0)),
     )

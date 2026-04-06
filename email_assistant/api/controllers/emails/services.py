@@ -106,26 +106,73 @@ def unique_senders(user_id: str, mailbox_id: str | None = None) -> dict:
     }
 
 
+def folder_counts(user_id: str, mailbox_id: str | None = None) -> dict:
+    """Return email counts per virtual folder."""
+    col = email_metadata_col()
+    base: dict = {"user_id": user_id}
+    if mailbox_id:
+        base["mailbox_id"] = mailbox_id
+    now = datetime.now(timezone.utc)
+
+    inbox_q = {**base, "archived": False, "trashed": False,
+               "$or": [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}]}
+    sent_q = {**base, "is_sent": True}
+    trash_q = {**base, "trashed": True, "$or": [{"spam": {"$ne": True}}, {"spam": {"$exists": False}}]}
+    spam_q = {**base, "spam": True}
+    snoozed_q = {**base, "snoozed_until": {"$gt": now}, "trashed": False}
+    archive_q = {**base, "archived": True, "trashed": False}
+    star_q = {**base, "starred": True, "trashed": False}
+
+    return {
+        "inbox": col.count_documents(inbox_q),
+        "sent": col.count_documents(sent_q),
+        "trash": col.count_documents(trash_q),
+        "archive": col.count_documents(archive_q),
+        "star": col.count_documents(star_q),
+        "spam": col.count_documents(spam_q),
+        "snoozed": col.count_documents(snoozed_q),
+    }
+
+
 def list_emails(
     user_id: str,
     mailbox_id: str | None = None,
     category: str | None = None,
     unread_only: bool = False,
     from_email: str | None = None,
+    label: str | None = None,
+    folder: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> list[dict]:
-    query: dict = {"user_id": user_id, "archived": False, "trashed": False}
+    now = datetime.now(timezone.utc)
+
+    if folder == "trash":
+        query: dict = {"user_id": user_id, "trashed": True,
+                       "$or": [{"spam": {"$ne": True}}, {"spam": {"$exists": False}}]}
+    elif folder == "spam":
+        query = {"user_id": user_id, "spam": True}
+    elif folder == "sent":
+        query = {"user_id": user_id, "is_sent": True}
+    elif folder == "archive":
+        query = {"user_id": user_id, "archived": True, "trashed": False}
+    elif folder == "star":
+        query = {"user_id": user_id, "starred": True, "trashed": False}
+    elif folder == "snoozed":
+        query = {"user_id": user_id, "trashed": False, "snoozed_until": {"$gt": now}}
+    else:
+        query = {"user_id": user_id, "archived": False, "trashed": False}
+        query["$or"] = [
+            {"snoozed_until": None},
+            {"snoozed_until": {"$lte": now}},
+        ]
+
     if mailbox_id:
         query["mailbox_id"] = mailbox_id
     if unread_only:
         query["read"] = False
-
-    now = datetime.now(timezone.utc)
-    query["$or"] = [
-        {"snoozed_until": None},
-        {"snoozed_until": {"$lte": now}},
-    ]
+    if label:
+        query["labels"] = label
 
     # Pre-filter email IDs from Qdrant when filtering by category or sender
     id_filter: list[str] | None = None
@@ -478,6 +525,7 @@ def get_attachment(user_id: str, email_id: str, attachment_index: int) -> dict |
 
 def _merge_email(mongo_doc: dict, qdrant_content: dict) -> dict:
     """Merge MongoDB mutable state with Qdrant immutable content."""
+    priority = mongo_doc.get("priority") or qdrant_content.get("priority", "medium")
     return {
         "id": str(mongo_doc["_id"]),
         "mailbox_id": mongo_doc.get("mailbox_id", ""),
@@ -492,7 +540,7 @@ def _merge_email(mongo_doc: dict, qdrant_content: dict) -> dict:
         "labels": mongo_doc.get("labels", []),
         "has_attachment": qdrant_content.get("has_attachment", False),
         "attachments": qdrant_content.get("attachments", []),
-        "priority": qdrant_content.get("priority", "medium"),
+        "priority": priority,
         "category": qdrant_content.get("category"),
         "ai_summary": None,
         "sentiment_score": None,

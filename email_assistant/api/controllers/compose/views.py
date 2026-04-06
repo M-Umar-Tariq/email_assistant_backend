@@ -15,6 +15,7 @@ def generate(request):
         context=request.data.get("context", ""),
         tone=request.data.get("tone", "formal"),
         sender_name=request.data.get("sender_name", ""),
+        user_id=getattr(request, "user_id", ""),
     )
     return Response({"draft": result})
 

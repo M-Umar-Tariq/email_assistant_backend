@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 from django.contrib.auth.hashers import make_password, check_password
 from bson import ObjectId
 
-from database.db import users_col, user_settings_col
+from database.db import users_col, user_settings_col, next_user_settings_int_id
+from api.admin_auth import user_is_admin
 
 
 def create_user(email: str, password: str, name: str) -> dict:
@@ -15,6 +16,7 @@ def create_user(email: str, password: str, name: str) -> dict:
         "password_hash": make_password(password),
         "name": name,
         "timezone": "UTC",
+        "disabled": False,
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc),
     }
@@ -22,6 +24,7 @@ def create_user(email: str, password: str, name: str) -> dict:
     doc["_id"] = result.inserted_id
 
     user_settings_col().insert_one({
+        "id": next_user_settings_int_id(),
         "user_id": str(result.inserted_id),
         "daily_briefing": True,
         "slack_digest": False,
@@ -30,6 +33,11 @@ def create_user(email: str, password: str, name: str) -> dict:
         "auto_labeling": True,
         "thread_summaries": True,
         "sync_range_months": 12,
+        "occupation": "",
+        "important_emails_notes": "",
+        "draft_style_notes": "",
+        "ai_label_rules": [],
+        "onboarding_completed": False,
         "updated_at": datetime.now(timezone.utc),
     })
 
@@ -40,6 +48,8 @@ def authenticate(email: str, password: str) -> dict:
     user = users_col().find_one({"email": email})
     if not user or not check_password(password, user["password_hash"]):
         raise ValueError("Invalid email or password")
+    if user.get("disabled"):
+        raise ValueError("Account disabled")
     return _serialize(user)
 
 
@@ -61,4 +71,6 @@ def _serialize(doc: dict) -> dict:
         "name": doc["name"],
         "timezone": doc.get("timezone", "UTC"),
         "created_at": doc["created_at"],
+        "is_admin": user_is_admin(doc),
+        "disabled": bool(doc.get("disabled")),
     }

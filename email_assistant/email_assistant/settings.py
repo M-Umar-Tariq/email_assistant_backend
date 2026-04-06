@@ -161,6 +161,13 @@ JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", SECRET_KEY)
 JWT_ACCESS_LIFETIME = timedelta(minutes=int(os.getenv("JWT_ACCESS_LIFETIME_MINUTES", "60")))
 JWT_REFRESH_LIFETIME = timedelta(days=int(os.getenv("JWT_REFRESH_LIFETIME_DAYS", "7")))
 
+# Comma-separated emails that always have admin API access (case-insensitive)
+ADMIN_EMAILS = frozenset(
+    e.strip().lower()
+    for e in os.getenv("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+)
+
 # ---------------------------------------------------------------------------
 # Encryption (Fernet key for IMAP/SMTP passwords)
 # ---------------------------------------------------------------------------
@@ -184,5 +191,3 @@ OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "nova")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")
-
-STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')

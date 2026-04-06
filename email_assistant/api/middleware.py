@@ -14,6 +14,8 @@ from rest_framework import status
 from database.db import users_col, refresh_tokens_col
 from bson import ObjectId
 
+from api.admin_auth import user_is_admin
+
 
 # ── Token helpers ────────────────────────────────────────────────────────────
 
@@ -81,4 +83,38 @@ def jwt_required(view_func):
 
         request.user_id = payload["user_id"]
         return view_func(request, *args, **kwargs)
+    return wrapper
+
+
+def admin_required(view_func):
+    """JWT access token + admin allowlist or `is_admin` on user document."""
+
+    @wraps(view_func)
+    def wrapper(request, *args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return Response(
+                {"error": "Authorization header missing or malformed"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        token = auth_header.split(" ", 1)[1]
+        try:
+            payload = decode_token(token)
+        except jwt.ExpiredSignatureError:
+            return Response({"error": "Token expired"}, status=status.HTTP_401_UNAUTHORIZED)
+        except jwt.InvalidTokenError:
+            return Response({"error": "Invalid token"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        if payload.get("type") != "access":
+            return Response({"error": "Invalid token type"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        request.user_id = payload["user_id"]
+        try:
+            user = users_col().find_one({"_id": ObjectId(request.user_id)})
+        except Exception:
+            user = None
+        if not user_is_admin(user):
+            return Response({"error": "Admin access required"}, status=status.HTTP_403_FORBIDDEN)
+        return view_func(request, *args, **kwargs)
+
     return wrapper

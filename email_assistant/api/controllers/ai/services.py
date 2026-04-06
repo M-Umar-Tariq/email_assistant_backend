@@ -391,6 +391,8 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
     ]
 
     from api.controllers.agent.profile import get_profile
+    from api.controllers.settings.services import get_user_preferences_prompt
+
     profile = get_profile(user_id)
     key_contacts = profile.get("key_contacts", [])
     contacts_lookup = [
@@ -399,10 +401,14 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
         if c.get("email")
     ]
 
+    user_prefs = get_user_preferences_prompt(user_id)
+    prefs_block = f"\n{user_prefs}\n\n" if user_prefs else ""
+
     system_prompt = (
         "You are an AI email assistant with full access to the user's mailbox. "
         "Today is " + now_str + ".\n"
-        + range_note +
+        + range_note
+        + prefs_block +
         f"\nMAILBOXES:\n{json.dumps(mailbox_info, default=str)}\n\n"
         f"KEY CONTACTS (use these to resolve names to email addresses):\n"
         f"{json.dumps(contacts_lookup, default=str)}\n\n"
@@ -585,16 +591,24 @@ def get_instant_replies(user_id: str, email_id: str) -> list[dict]:
         return []
 
     from api.controllers.emails.services import _reassemble_body
+    from api.controllers.settings.services import get_user_preferences_prompt
+
     body = _reassemble_body(email_id, user_id)
+    user_prefs = get_user_preferences_prompt(user_id)
 
     prompt = (
         f"From: {content.get('from_name', '')} <{content.get('from_email', '')}>\n"
         f"Subject: {content.get('subject', '')}\n\n{body[:2000]}"
     )
 
+    style_hint = ""
+    if user_prefs:
+        style_hint = f"\n{user_prefs}\nMatch the user's preferred draft style when writing replies.\n"
+
     raw = chat(
         system_prompt=(
             "Generate 3 short reply options for the email below. "
+            + style_hint +
             "Format as JSON array with objects: "
             '[{"label": "short label", "tone": "positive|neutral|negative", "text": "full reply text"}]. '
             "Return ONLY valid JSON."

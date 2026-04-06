@@ -88,8 +88,12 @@ def agent_chat(
             })
         email_context = ("\n\n" if use_compact else "\n\n━━━━━━━━━━━━━━━━━━━━\n\n").join(blocks)
 
+    from api.controllers.settings.services import get_user_preferences_prompt
+
     now_str = datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M UTC")
     profile_summary = _format_profile(profile)
+    user_prefs = get_user_preferences_prompt(user_id)
+    prefs_block = f"\n{user_prefs}\n\n" if user_prefs else ""
 
     key_contacts = profile.get("key_contacts", [])
     contacts_lookup = [
@@ -101,6 +105,7 @@ def agent_chat(
     system_prompt = (
         f"You are a personal AI assistant. Today is {now_str}.\n\n"
         f"USER PROFILE (learned from their emails):\n{profile_summary}\n\n"
+        + prefs_block +
         f"MAILBOXES:\n{json.dumps(mailbox_info, default=str)}\n\n"
         f"KEY CONTACTS (use these to resolve spoken names to email addresses):\n"
         f"{json.dumps(contacts_lookup, default=str)}\n\n"

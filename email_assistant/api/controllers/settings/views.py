@@ -19,3 +19,11 @@ def settings_view(request):
         return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
     data = services.update_settings(request.user_id, ser.validated_data)
     return Response(data)
+
+
+@api_view(["POST"])
+@jwt_required
+def relabel_emails(request):
+    """Re-classify all emails with the user's current label rules + priority."""
+    result = services.relabel_all_emails(request.user_id)
+    return Response(result)

@@ -39,6 +39,26 @@ def follow_ups_col():
 def user_settings_col():
     return get_db()["user_settings"]
 
+
+def next_user_settings_int_id() -> int:
+    """
+    Next integer `id` for user_settings documents.
+
+    Djongo creates a unique index on Django's primary key field `id`. Raw PyMongo
+    inserts without `id` store null for every row, causing E11000 duplicate key
+    on the second insert.
+    """
+    col = user_settings_col()
+    pipeline = [{"$group": {"_id": None, "max_id": {"$max": "$id"}}}]
+    rows = list(col.aggregate(pipeline))
+    if not rows or rows[0].get("max_id") is None:
+        return 1
+    try:
+        return int(rows[0]["max_id"]) + 1
+    except (TypeError, ValueError):
+        return 1
+
+
 def refresh_tokens_col():
     return get_db()["refresh_tokens"]
 
@@ -48,6 +68,15 @@ def email_attachments_col():
 def agent_profiles_col():
     return get_db()["agent_profiles"]
 
+
+def meetings_col():
+    """User calendar meetings (from email AI extraction or manual)."""
+    return get_db()["meetings"]
+
+
+def feedback_col():
+    """User-submitted product feedback (bug reports, ideas, etc.)."""
+    return get_db()["feedback"]
 
 
 # ── Qdrant ───────────────────────────────────────────────────────────────────
@@ -142,6 +171,9 @@ def ensure_indexes():
     _safe_create_index(follow_ups_col(), [("user_id", 1), ("status", 1)])
     _safe_create_index(refresh_tokens_col(), "expires_at", expireAfterSeconds=0)
     _safe_create_index(agent_profiles_col(), "user_id", unique=True)
+    _safe_create_index(meetings_col(), [("user_id", 1), ("start", 1)])
+    _safe_create_index(meetings_col(), [("user_id", 1), ("end", 1)])
+    _safe_create_index(feedback_col(), [("user_id", 1), ("created_at", -1)])
 
 
 def reset_stale_syncs(max_age_minutes: int = 15):

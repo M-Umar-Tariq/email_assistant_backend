@@ -66,6 +66,8 @@ def _exec_send_email(user_id: str, action: dict) -> dict:
 # ── AI-generated reply draft ─────────────────────────────────────────────────
 
 def _exec_draft_reply(user_id: str, action: dict) -> dict:
+    from api.controllers.settings.services import get_user_preferences_prompt
+
     email_id = action.get("email_id", "")
     content = get_email_content(email_id, user_id) if email_id else None
     if not content:
@@ -77,9 +79,12 @@ def _exec_draft_reply(user_id: str, action: dict) -> dict:
         f"{content.get('body_chunk','')[:2000]}"
     )
     instructions = action.get("instructions", "Write a helpful reply")
+    user_prefs = get_user_preferences_prompt(user_id)
+    style_note = f"\n{user_prefs}\nFollow the user's preferred draft style.\n" if user_prefs else ""
     draft = chat(
         system_prompt=(
             "Draft a reply email. Match the formality of the original. Be concise and natural."
+            + style_note
         ),
         user_message=f"Original email:\n{context}\n\nInstructions: {instructions}",
         temperature=0.6,
@@ -99,16 +104,21 @@ def _exec_send_reply(user_id: str, action: dict) -> dict:
 
     body = action.get("body", "").strip()
     if not body:
+        from api.controllers.settings.services import get_user_preferences_prompt
+
         instructions = action.get("instructions", "Write a helpful reply")
         context = (
             f"From: {content.get('from_name','')} <{content.get('from_email','')}>\n"
             f"Subject: {content.get('subject','')}\n\n"
             f"{content.get('body_chunk','')[:2000]}"
         )
+        user_prefs = get_user_preferences_prompt(user_id)
+        style_note = f"\n{user_prefs}\nFollow the user's preferred draft style.\n" if user_prefs else ""
         body = chat(
             system_prompt=(
                 "Draft a reply email. Match the formality of the original. Be concise and natural. "
                 "Return ONLY the email body text (no subject, no metadata)."
+                + style_note
             ),
             user_message=f"Original email:\n{context}\n\nInstructions: {instructions}",
             temperature=0.6,

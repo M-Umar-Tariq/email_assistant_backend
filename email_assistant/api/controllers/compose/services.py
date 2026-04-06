@@ -5,13 +5,21 @@ from api.utils.llm import chat
 from api.utils.qdrant_helpers import scroll_all_chunk0
 
 
-def generate_draft(to: str = "", subject: str = "", context: str = "", tone: str = "formal", sender_name: str = "") -> str:
+def generate_draft(to: str = "", subject: str = "", context: str = "", tone: str = "formal", sender_name: str = "", user_id: str = "") -> str:
     name_for_signoff = sender_name.strip() if sender_name else "the sender"
     prompt = (
         f"To: {to}\nSubject: {subject}\n"
         f"Context/instructions: {context}\nTone: {tone}\n"
         f"MY NAME IS: {name_for_signoff}"
     )
+
+    style_note = ""
+    if user_id:
+        from api.controllers.settings.services import get_user_preferences_prompt
+        prefs = get_user_preferences_prompt(user_id)
+        if prefs:
+            style_note = f"\n{prefs}\nHonour the user's preferred draft style when writing.\n"
+
     return chat(
         system_prompt=(
             "You are an email drafting assistant. Write a professional email "
@@ -20,6 +28,7 @@ def generate_draft(to: str = "", subject: str = "", context: str = "", tone: str
             f"You MUST sign off using exactly \"{name_for_signoff}\" — "
             "NEVER write [Your Name], [Name], or any placeholder. "
             "Return ONLY the email body text (no subject line, no metadata)."
+            + style_note
         ),
         user_message=prompt,
         temperature=0.7,

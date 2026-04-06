@@ -20,7 +20,7 @@ from database.db import mailboxes_col, email_metadata_col, email_attachments_col
 from api.utils.encryption import encrypt, decrypt
 from api.utils.chunking import chunk_text
 from api.utils.embedding import embed_texts
-from api.utils.classify import classify_emails_batch
+from api.utils.classify import classify_emails_batch, assign_labels_batch, extract_meetings_batch
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 
 
@@ -420,6 +420,16 @@ def sync_mailbox(
                     for idx, a in enumerate(attachments) if a.get("data_b64")
                 ]
 
+                ics_extra_parts = []
+                for a in attachments:
+                    ct = (a.get("content_type") or "").lower()
+                    fn = (a.get("filename") or "").lower()
+                    if "calendar" in ct or fn.endswith(".ics"):
+                        t = a.get("text") or ""
+                        if t:
+                            ics_extra_parts.append(t)
+                ics_extra = "\n\n".join(ics_extra_parts)
+
                 parsed_batch.append({
                     "email_id": email_id,
                     "mid": mid,
@@ -431,6 +441,7 @@ def sync_mailbox(
                     "preview": preview,
                     "body": body,
                     "body_html": body_html,
+                    "ics_extra": ics_extra,
                     "read": b"\\Seen" in data.get(b"FLAGS", []),
                     "starred": b"\\Flagged" in data.get(b"FLAGS", []),
                     "replied": b"\\Answered" in data.get(b"FLAGS", []),
@@ -452,7 +463,7 @@ def sync_mailbox(
                 for e in parsed_batch
                 if e["date"] and e["date"] >= start_of_today
             ]
-            today_classifications = classify_emails_batch(today_emails_for_classify) if today_emails_for_classify else []
+            today_classifications = classify_emails_batch(today_emails_for_classify, user_id=user_id) if today_emails_for_classify else []
 
             # Build a map: index into today_classifications for today's emails
             classify_iter = iter(today_classifications)
@@ -463,8 +474,50 @@ def sync_mailbox(
                 else:
                     ai_classifications.append({"priority": "medium", "category": None})
 
-            # 3d) Store this batch: MongoDB (state) + Qdrant (content)
-            for email_data, ai_cls in zip(parsed_batch, ai_classifications):
+            # 3d) Custom label assignment using user's ai_label_rules
+            try:
+                from api.controllers.settings.services import get_settings as _get_settings
+                _user_settings = _get_settings(user_id)
+                _label_rules = _user_settings.get("ai_label_rules") or []
+            except Exception:
+                _label_rules = []
+
+            if _label_rules:
+                _emails_for_labelling = [
+                    {"subject": e["subject"], "from_name": e["from_name"], "from_email": e["from_email"], "preview": e["preview"]}
+                    for e in parsed_batch
+                ]
+                batch_labels = assign_labels_batch(_emails_for_labelling, _label_rules)
+            else:
+                batch_labels = [[] for _ in parsed_batch]
+
+            # 3d2) Meeting extraction (today's emails only)
+            start_of_today_mt = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            today_meeting_inputs = [
+                {
+                    "email_id": e["email_id"],
+                    "subject": e.get("subject", ""),
+                    "from_name": e.get("from_name", ""),
+                    "from_email": e.get("from_email", ""),
+                    "preview": e.get("preview", ""),
+                    "body": (e.get("body") or "")[:2500],
+                    "body_html": (e.get("body_html") or "")[:8000],
+                    "email_date": e["date"].isoformat() if e.get("date") else "",
+                    "ics_extra": e.get("ics_extra") or "",
+                }
+                for e in parsed_batch
+                if e.get("date") and e["date"] >= start_of_today_mt
+            ]
+            meeting_extractions = (
+                extract_meetings_batch(today_meeting_inputs) if today_meeting_inputs else []
+            )
+            meeting_by_email_id = {
+                today_meeting_inputs[i]["email_id"]: meeting_extractions[i]
+                for i in range(len(today_meeting_inputs))
+            }
+
+            # 3e) Store this batch: MongoDB (state) + Qdrant (content)
+            for email_data, ai_cls, email_labels in zip(parsed_batch, ai_classifications, batch_labels):
                 try:
                     ai_priority = ai_cls.get("priority", "medium")
                     ai_category = ai_cls.get("category")
@@ -485,7 +538,8 @@ def sync_mailbox(
                         "starred": email_data["starred"],
                         "replied_at": email_data["date"].isoformat() if email_data["replied"] and email_data["date"] else None,
                         "reply_count": 1 if email_data["replied"] else 0,
-                        "labels": [],
+                        "labels": email_labels,
+                        "priority": ai_priority,
                         "snoozed_until": None,
                         "archived": False,
                         "trashed": False,
@@ -556,6 +610,16 @@ def sync_mailbox(
                             })
                         except Exception:
                             pass
+
+                    mtg = meeting_by_email_id.get(email_data["email_id"])
+                    if mtg:
+                        try:
+                            from api.controllers.calendar.services import upsert_meeting_from_email
+                            upsert_meeting_from_email(
+                                user_id, email_data["email_id"], mtg, mailbox_id=mailbox_id
+                            )
+                        except Exception as mtg_err:
+                            print(f"[SYNC] Meeting upsert skipped: {mtg_err}")
 
                     synced_count += 1
                 except Exception as email_err:

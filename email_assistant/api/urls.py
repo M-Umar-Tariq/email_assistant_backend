@@ -15,6 +15,7 @@ except Exception as e:
     print(f"[STARTUP] Sync status reset failed: {e}")
 
 urlpatterns = [
+    path("admin/", include("api.controllers.admin.urls")),
     path("auth/", include("api.controllers.auth.urls")),
     path("mailboxes/", include("api.controllers.mailboxes.urls")),
     path("emails/", include("api.controllers.emails.urls")),
@@ -26,4 +27,6 @@ urlpatterns = [
     path("compose/", include("api.controllers.compose.urls")),
     path("settings/", include("api.controllers.settings.urls")),
     path("search/", include("api.controllers.search.urls")),
+    path("calendar/", include("api.controllers.calendar.urls")),
+    path("feedback/", include("api.controllers.feedback.urls")),
 ]

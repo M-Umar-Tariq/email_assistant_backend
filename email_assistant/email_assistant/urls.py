@@ -6,7 +6,7 @@ def home(request):
     return HttpResponse("""
     <html>
     <head>
-        <title>Email Assistant</title>
+        <title>Smart Mail AI — API</title>
         <style>
             body {
                 margin: 0;
@@ -41,9 +41,8 @@ def home(request):
     </head>
     <body>
         <div class="container">
-            <h1>Welcome to Email Assistant Backend API</h1>
+            <h1>Welcome to Smart Mail AI Backend API</h1>
             <p>Your backend server is running successfully.</p>
-            <p>Developed by Muhammad Umar Tariq with love 😀</p>
             <div class="tag">Django API Server</div>
         </div>
     </body>

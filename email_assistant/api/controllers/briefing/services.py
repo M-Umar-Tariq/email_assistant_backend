@@ -1,6 +1,7 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-from database.db import email_metadata_col, mailboxes_col, follow_ups_col
+from database.db import email_metadata_col, mailboxes_col, follow_ups_col, meetings_col
+from api.controllers.calendar.services import get_today_meeting_stats
 from api.utils.llm import chat, chat_json
 from api.utils.qdrant_helpers import get_email_content, get_emails_content_batch
 
@@ -78,16 +79,62 @@ def get_briefing(user_id: str) -> dict:
 
     briefing_items = _build_briefing_items(high_priority, recent, user_id)
 
+    mtg_stats = get_today_meeting_stats(user_id)
+    meeting_items = _meeting_briefing_items(user_id, start_of_day)
+
     return {
         "stats": {
             "unread_total": unread_count,
             "high_priority": len(high_priority),
             "overdue_follow_ups": overdue_follow_ups,
             "pending_follow_ups": pending_follow_ups,
+            "meetings_today_count": mtg_stats["meetings_today_count"],
+            "meetings_today_conflicts": mtg_stats["meetings_today_conflicts"],
+            "next_meeting": mtg_stats["next_meeting"],
         },
         "mailboxes": mailbox_summary,
-        "items": briefing_items,
+        "items": meeting_items + briefing_items,
     }
+
+
+def _meeting_briefing_items(user_id: str, start_of_day: datetime) -> list[dict]:
+    """Upcoming today's calendar entries for the briefing list."""
+    end_of_day = start_of_day + timedelta(days=1)
+    docs = list(
+        meetings_col()
+        .find(
+            {
+                "user_id": user_id,
+                "start": {"$lt": end_of_day},
+                "end": {"$gt": start_of_day},
+            }
+        )
+        .sort("start", 1)
+        .limit(8)
+    )
+    out = []
+    for m in docs:
+        mid = str(m["_id"])
+        st = m["start"]
+        en = m["end"]
+        st_s = st.isoformat() if isinstance(st, datetime) else str(st)
+        en_s = en.isoformat() if isinstance(en, datetime) else str(en)
+        eid = m.get("email_id")
+        desc = f"{st_s} – {en_s}"
+        if m.get("conflict"):
+            desc += " · Overlapping time — check calendar"
+        out.append(
+            {
+                "id": f"cal-{mid}",
+                "type": "meeting",
+                "title": m.get("title") or "Meeting",
+                "description": desc,
+                "priority": "high" if m.get("conflict") else "medium",
+                "email_ids": [eid] if eid else [],
+                "meeting_id": mid,
+            }
+        )
+    return out
 
 
 def _build_briefing_items(high_priority: list, recent: list, user_id: str) -> list[dict]:
@@ -213,9 +260,14 @@ def generate_ai_briefing(user_id: str) -> list[dict]:
 
     prompt = "\n\n".join(sections)
 
+    from api.controllers.settings.services import get_user_preferences_prompt
+    user_prefs = get_user_preferences_prompt(user_id)
+    prefs_hint = f"\n{user_prefs}\nPrioritise items the user marked as important.\n" if user_prefs else ""
+
     llm_result = chat_json(
         system_prompt=(
             "You are a smart email assistant. Analyze today's emails for each mailbox separately. "
+            + prefs_hint +
             'Return JSON: {"summaries": [{"mailbox": "exact mailbox name", "summary": "2-3 bullet points"}]}. '
             "Each summary must have 2-3 concise bullet points using the • character. "
             "Mention specific senders and subjects. Be actionable and specific. "
