@@ -7,6 +7,7 @@ from pathlib import Path
 from datetime import timedelta
 from dotenv import load_dotenv
 
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 load_dotenv(BASE_DIR / ".env")
@@ -191,3 +192,10 @@ OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "nova")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")
+
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+STATIC_ROOT = BASE_DIR / "staticfiles"

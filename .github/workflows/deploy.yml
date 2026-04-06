@@ -40,5 +40,5 @@ jobs:
           & $python manage.py migrate
           & $python manage.py collectstatic --noinput
 
-          pm2 restart email-assistant-backend
+          pm2 restart email-backend
           pm2 save
