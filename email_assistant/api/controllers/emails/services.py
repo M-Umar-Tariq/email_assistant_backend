@@ -1,7 +1,9 @@
 import smtplib
+import uuid
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import make_msgid
 
 from bson import ObjectId
 from django.conf import settings
@@ -161,10 +163,11 @@ def list_emails(
     elif folder == "snoozed":
         query = {"user_id": user_id, "trashed": False, "snoozed_until": {"$gt": now}}
     else:
-        query = {"user_id": user_id, "archived": False, "trashed": False}
-        query["$or"] = [
-            {"snoozed_until": None},
-            {"snoozed_until": {"$lte": now}},
+        query = {"user_id": user_id, "archived": False, "trashed": False,
+                 "$or": [{"is_sent": {"$ne": True}}, {"is_sent": {"$exists": False}}]}
+        query["$and"] = [
+            {"$or": query.pop("$or")},
+            {"$or": [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}]},
         ]
 
     if mailbox_id:
@@ -235,6 +238,11 @@ def get_email(user_id: str, email_id: str) -> dict | None:
             result["body"] = clean_email_body(body) if body else body or ""
         except Exception:
             result["body"] = ""
+        result["body_is_html"] = False
+
+    # Fallback for compose-sent emails (body stored in MongoDB, not Qdrant)
+    if not result.get("body") and meta.get("sent_body"):
+        result["body"] = meta["sent_body"]
         result["body_is_html"] = False
 
     result["thread_id"] = meta.get("thread_id")
@@ -336,6 +344,40 @@ def send_email(user_id: str, data: dict) -> dict:
     msg.attach(MIMEText(data["body"], "plain"))
 
     _smtp_send(mb, msg)
+
+    sent_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    raw_body = data.get("body") or ""
+    body_preview = raw_body[:300] or "(no preview)"
+    to_list = data["to"] if isinstance(data["to"], list) else [data["to"]]
+    email_metadata_col().insert_one({
+        "_id": sent_id,
+        "user_id": user_id,
+        "mailbox_id": data["mailbox_id"],
+        "message_id": f"<sent-{sent_id}>",
+        "thread_id": f"<sent-{sent_id}>",
+        "in_reply_to": "",
+        "subject": data["subject"],
+        "from_name": mb.get("name", ""),
+        "from_email": mb["email"],
+        "to": [{"name": "", "email": e} for e in to_list],
+        "preview": body_preview,
+        "sent_body": raw_body,
+        "date": now,
+        "original_date": now,
+        "read": True,
+        "starred": False,
+        "replied_at": None,
+        "reply_count": 0,
+        "labels": [],
+        "priority": "medium",
+        "snoozed_until": None,
+        "archived": False,
+        "trashed": False,
+        "is_sent": True,
+        "created_at": now,
+    })
+
     return {"status": "sent", "to": data["to"], "subject": data["subject"]}
 
 
@@ -359,16 +401,22 @@ def reply_email(user_id: str, email_id: str, data: dict) -> dict:
     to_str = ", ".join(to_list) if to_list else ""
     subject = data.get("subject") or f"Re: {content.get('subject', '')}"
 
+    parent_mid = meta.get("message_id", "")
+    reply_msg_id = make_msgid()
     msg = MIMEMultipart()
     msg["From"] = mb["email"]
     msg["To"] = to_str
     msg["Subject"] = subject
-    msg["In-Reply-To"] = meta.get("message_id", "")
+    msg["Message-ID"] = reply_msg_id
+    msg["In-Reply-To"] = parent_mid
+    if parent_mid:
+        msg["References"] = parent_mid
     msg.attach(MIMEText(data["body"], "plain"))
 
     _smtp_send(mb, msg)
     now_iso = datetime.now(timezone.utc).isoformat()
     sent_reply_doc = {
+        "message_id": reply_msg_id.strip(),
         "body": data["body"],
         "subject": subject,
         "to": to_list or [content.get("from_email", "")],
@@ -381,6 +429,7 @@ def reply_email(user_id: str, email_id: str, data: dict) -> dict:
             "$set": {"replied_at": now_iso},
             "$inc": {"reply_count": 1},
             "$push": {"sent_replies": sent_reply_doc},
+            "$addToSet": {"thread_message_ids": reply_msg_id.strip()},
         },
     )
     return {"status": "sent", "to": sent_reply_doc["to"], "subject": subject, "sent_reply": sent_reply_doc}
@@ -526,15 +575,16 @@ def get_attachment(user_id: str, email_id: str, attachment_index: int) -> dict |
 def _merge_email(mongo_doc: dict, qdrant_content: dict) -> dict:
     """Merge MongoDB mutable state with Qdrant immutable content."""
     priority = mongo_doc.get("priority") or qdrant_content.get("priority", "medium")
+    thread_count = 1 + len(mongo_doc.get("thread_replies", [])) + len(mongo_doc.get("sent_replies", []))
     return {
         "id": str(mongo_doc["_id"]),
         "mailbox_id": mongo_doc.get("mailbox_id", ""),
-        "subject": qdrant_content.get("subject", ""),
-        "from_name": qdrant_content.get("from_name", ""),
-        "from_email": qdrant_content.get("from_email", ""),
-        "to": qdrant_content.get("to", []),
+        "subject": qdrant_content.get("subject") or mongo_doc.get("subject", ""),
+        "from_name": qdrant_content.get("from_name") or mongo_doc.get("from_name", ""),
+        "from_email": qdrant_content.get("from_email") or mongo_doc.get("from_email", ""),
+        "to": qdrant_content.get("to") or mongo_doc.get("to", []),
         "date": mongo_doc.get("date"),
-        "preview": qdrant_content.get("preview", ""),
+        "preview": qdrant_content.get("preview") or mongo_doc.get("preview", ""),
         "read": mongo_doc.get("read", False),
         "starred": mongo_doc.get("starred", False),
         "labels": mongo_doc.get("labels", []),
@@ -546,4 +596,5 @@ def _merge_email(mongo_doc: dict, qdrant_content: dict) -> dict:
         "sentiment_score": None,
         "replied_at": mongo_doc.get("replied_at"),
         "snoozed_until": mongo_doc.get("snoozed_until"),
+        "thread_count": thread_count,
     }

@@ -55,6 +55,9 @@ def search_emails(
 
         # Mutable state from MongoDB
         meta = email_metadata_col().find_one({"_id": email_id})
+        thread_count = 1
+        if meta:
+            thread_count += len(meta.get("thread_replies", [])) + len(meta.get("sent_replies", []))
 
         email_list.append({
             "id": email_id,
@@ -68,6 +71,7 @@ def search_emails(
             "starred": meta.get("starred", False) if meta else False,
             "priority": payload.get("priority", "medium"),
             "category": payload.get("category") or None,
+            "thread_count": thread_count,
             "relevance_score": item["relevance_score"],
         })
 

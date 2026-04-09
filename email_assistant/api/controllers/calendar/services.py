@@ -31,6 +31,15 @@ def recompute_conflicts_for_user(user_id: str) -> None:
                 continue
 
 
+def _norm_meeting_link(v) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    return s[:2000]
+
+
 def _serialize(m: dict) -> dict:
     return {
         "id": str(m["_id"]),
@@ -38,6 +47,7 @@ def _serialize(m: dict) -> dict:
         "start": m["start"].isoformat() if isinstance(m.get("start"), datetime) else m.get("start"),
         "end": m["end"].isoformat() if isinstance(m.get("end"), datetime) else m.get("end"),
         "location": m.get("location"),
+        "meeting_link": m.get("meeting_link"),
         "attendees": m.get("attendees") or [],
         "notes": m.get("notes") or "",
         "source": m.get("source", "manual"),
@@ -203,6 +213,7 @@ def create_meeting(user_id: str, data: dict) -> tuple[dict | None, list[str]]:
         "start": start,
         "end": end,
         "location": data.get("location"),
+        "meeting_link": _norm_meeting_link(data.get("meeting_link")),
         "attendees": data.get("attendees") if isinstance(data.get("attendees"), list) else [],
         "notes": (data.get("notes") or "")[:4000],
         "source": "manual",
@@ -227,10 +238,19 @@ def update_meeting(user_id: str, meeting_id: str, data: dict) -> dict | None:
         updates["title"] = (data.get("title") or "").strip() or "Meeting"
     if "location" in data:
         updates["location"] = data.get("location")
+    if "meeting_link" in data:
+        updates["meeting_link"] = _norm_meeting_link(data.get("meeting_link"))
     if "attendees" in data and isinstance(data.get("attendees"), list):
         updates["attendees"] = data["attendees"]
     if "notes" in data:
         updates["notes"] = (data.get("notes") or "")[:4000]
+    if "mailbox_id" in data:
+        mb_raw = data.get("mailbox_id")
+        updates["mailbox_id"] = (
+            str(mb_raw).strip()
+            if isinstance(mb_raw, str) and str(mb_raw).strip()
+            else None
+        )
     start = _parse_dt(data.get("start")) if "start" in data else existing["start"]
     end = _parse_dt(data.get("end")) if "end" in data else existing["end"]
     if "start" in data or "end" in data:
@@ -297,7 +317,7 @@ def upsert_meeting_from_email(
 
 
 def get_today_meeting_stats(user_id: str) -> dict:
-    """Counts and next meeting for briefing dashboard."""
+    """Counts and next meeting for briefing dashboard (only meetings not ended yet today)."""
     col = meetings_col()
     now = datetime.now(timezone.utc)
     sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -308,16 +328,11 @@ def get_today_meeting_stats(user_id: str) -> dict:
         "end": {"$gt": sod},
     }
     today = list(col.find(q).sort("start", 1))
-    conflicts = sum(1 for m in today if m.get("conflict"))
-    next_m = None
-    for m in today:
-        if m["end"] > now:
-            next_m = _serialize(m)
-            break
-    if not next_m and today:
-        next_m = _serialize(today[0])
+    remaining = [m for m in today if m["end"] > now]
+    conflicts = sum(1 for m in remaining if m.get("conflict"))
+    next_m = _serialize(remaining[0]) if remaining else None
     return {
-        "meetings_today_count": len(today),
+        "meetings_today_count": len(remaining),
         "meetings_today_conflicts": conflicts,
         "next_meeting": next_m,
     }

@@ -135,6 +135,15 @@ def delete_mailbox(user_id: str, mailbox_id: str) -> bool:
     return result.deleted_count > 0
 
 
+def _message_id_variants(mid: str) -> list[str]:
+    """Return common forms of the same RFC Message-ID (with/without angle brackets)."""
+    m = (mid or "").strip()
+    if not m:
+        return []
+    stripped = m.strip("<>")
+    return list({m, stripped, f"<{stripped}>"})
+
+
 # ── IMAP sync ────────────────────────────────────────────────────────────────
 
 def sync_mailbox(
@@ -325,12 +334,11 @@ def sync_mailbox(
                 if parsed_date and not parsed_date.tzinfo:
                     parsed_date = parsed_date.replace(tzinfo=timezone.utc)
 
-                # IMAP SINCE is date-level only; filter at time-level so
-                # "only new" mailboxes never pull in older same-day emails.
-                since_aware = since.replace(tzinfo=timezone.utc) if since and not since.tzinfo else since
-                if since_aware and parsed_date and initial_sync not in ("last_n", "all") and parsed_date < since_aware:
-                    skipped += 1
-                    continue
+                # Dedup is handled by existing_map / thread_known_mids above
+                # and the unique index on (user_id, message_id, mailbox_id).
+                # The old time-level filter (parsed_date < last_sync_at)
+                # permanently lost emails whose Date header was before
+                # last_sync_at even when IMAP delivered them after.
 
                 preview = (body[:300] if body else "") or "(no preview)"
 
@@ -340,8 +348,9 @@ def sync_mailbox(
                 parent_mid = in_reply_to or (references.split()[-1] if references else "")
 
                 if parent_mid:
+                    pm_variants = _message_id_variants(parent_mid)
                     parent = email_metadata_col().find_one(
-                        {"user_id": user_id, "mailbox_id": mailbox_id, "message_id": parent_mid}
+                        {"user_id": user_id, "mailbox_id": mailbox_id, "message_id": {"$in": pm_variants}}
                     )
                     if not parent:
                         ref_list = references.split() if references else []
@@ -349,19 +358,42 @@ def sync_mailbox(
                             if ref_mid == parent_mid:
                                 continue
                             parent = email_metadata_col().find_one(
-                                {"user_id": user_id, "mailbox_id": mailbox_id, "message_id": ref_mid}
+                                {
+                                    "user_id": user_id,
+                                    "mailbox_id": mailbox_id,
+                                    "message_id": {"$in": _message_id_variants(ref_mid)},
+                                }
                             )
                             if parent:
                                 break
 
                     if parent:
-                        # Skip if this is our own sent reply (already stored in sent_replies)
                         mb_email = mb.get("email", "") or mb.get("username", "")
                         if from_email_addr and mb_email and from_email_addr.lower() == mb_email.lower():
-                            email_metadata_col().update_one(
-                                {"_id": parent["_id"]},
-                                {"$addToSet": {"thread_message_ids": mid}},
-                            )
+                            # Own reply (possibly sent from external client) — store in sent_replies with dedup
+                            existing_tmids: set[str] = set()
+                            for t in parent.get("thread_message_ids", []):
+                                existing_tmids.update(_message_id_variants(t))
+                            for r in parent.get("sent_replies", []):
+                                if r.get("message_id"):
+                                    existing_tmids.update(_message_id_variants(r["message_id"]))
+                            if not (set(_message_id_variants(mid)) & existing_tmids):
+                                own_reply_doc = {
+                                    "message_id": mid,
+                                    "body": body or "",
+                                    "subject": subject,
+                                    "to": [t.get("email", "") for t in to_list] if to_list else [],
+                                    "from_email": from_email_addr,
+                                    "date": parsed_date.isoformat() if parsed_date else datetime.now(timezone.utc).isoformat(),
+                                }
+                                email_metadata_col().update_one(
+                                    {"_id": parent["_id"]},
+                                    {
+                                        "$push": {"sent_replies": own_reply_doc},
+                                        "$addToSet": {"thread_message_ids": mid},
+                                    },
+                                )
+                                thread_replies_added += 1
                             continue
 
                         thread_reply_doc = {
@@ -442,6 +474,7 @@ def sync_mailbox(
                     "body": body,
                     "body_html": body_html,
                     "ics_extra": ics_extra,
+                    "in_reply_to": in_reply_to,
                     "read": b"\\Seen" in data.get(b"FLAGS", []),
                     "starred": b"\\Flagged" in data.get(b"FLAGS", []),
                     "replied": b"\\Answered" in data.get(b"FLAGS", []),
@@ -529,6 +562,8 @@ def sync_mailbox(
                         "user_id": user_id,
                         "mailbox_id": mailbox_id,
                         "message_id": email_data["mid"],
+                        "in_reply_to": email_data.get("in_reply_to", ""),
+                        "thread_id": email_data["mid"],
                         "subject": email_data.get("subject", ""),
                         "from_name": email_data.get("from_name", ""),
                         "from_email": email_data.get("from_email", ""),
@@ -550,6 +585,13 @@ def sync_mailbox(
                     except DuplicateKeyError:
                         skipped += 1
                         continue
+
+                    orphan_count = _adopt_orphan_replies(
+                        user_id, mailbox_id, email_data["email_id"],
+                        email_data["mid"], qdrant,
+                        mb.get("email", "") or mb.get("username", ""),
+                    )
+                    thread_replies_added += orphan_count
 
                     raw_html = email_data["body_html"] or ""
                     safe_html = raw_html[:524288] if len(raw_html) > 524288 else raw_html
@@ -644,6 +686,147 @@ def sync_mailbox(
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _adopt_orphan_replies(
+    user_id: str,
+    mailbox_id: str,
+    parent_id: str,
+    parent_message_id: str,
+    qdrant,
+    mb_email: str,
+) -> int:
+    """After inserting a root email, find orphan emails whose in_reply_to matches
+    this email's message_id and merge them as thread replies on the parent."""
+    merged = 0
+    queue = [parent_message_id]
+    seen = {parent_message_id}
+
+    while queue:
+        check_mid = queue.pop(0)
+        id_forms = _message_id_variants(check_mid)
+        if not id_forms:
+            continue
+        orphans = list(email_metadata_col().find({
+            "user_id": user_id,
+            "mailbox_id": mailbox_id,
+            "in_reply_to": {"$in": id_forms},
+            "_id": {"$ne": parent_id},
+        }))
+
+        for orphan in orphans:
+            orphan_id = str(orphan["_id"])
+            orphan_mid = orphan.get("message_id", "")
+
+            try:
+                scroll_res = qdrant.scroll(
+                    collection_name=settings.QDRANT_COLLECTION_EMAIL_CHUNKS,
+                    scroll_filter=Filter(must=[
+                        FieldCondition(key="email_id", match=MatchValue(value=orphan_id)),
+                        FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    ]),
+                    limit=500, with_payload=True, with_vectors=False,
+                )
+                all_points = scroll_res[0] if scroll_res else []
+                sorted_chunks = sorted(all_points, key=lambda p: p.payload.get("chunk_index", 0))
+                body = "\n".join(p.payload.get("body_chunk", "") for p in sorted_chunks)
+                chunk0 = sorted_chunks[0] if sorted_chunks else None
+            except Exception:
+                body, chunk0 = "", None
+
+            to_raw = chunk0.payload.get("to", "[]") if chunk0 else "[]"
+            try:
+                to_list = json.loads(to_raw) if isinstance(to_raw, str) else to_raw
+            except Exception:
+                to_list = []
+            preview = chunk0.payload.get("preview", "") if chunk0 else ""
+            body_html = chunk0.payload.get("body_html", "") if chunk0 else ""
+
+            orphan_date = orphan.get("date")
+            date_str = orphan_date.isoformat() if isinstance(orphan_date, datetime) else str(orphan_date or datetime.now(timezone.utc).isoformat())
+            orphan_from = orphan.get("from_email", "")
+            is_own = orphan_from and mb_email and orphan_from.lower() == mb_email.lower()
+
+            replies_to_push = []
+            sent_to_push = []
+            if is_own:
+                sent_to_push.append({
+                    "message_id": orphan_mid,
+                    "body": body or "",
+                    "subject": orphan.get("subject", ""),
+                    "to": [t.get("email", "") if isinstance(t, dict) else str(t) for t in to_list] if to_list else [],
+                    "from_email": orphan_from,
+                    "date": date_str,
+                })
+            else:
+                replies_to_push.append({
+                    "message_id": orphan_mid,
+                    "from_name": orphan.get("from_name", ""),
+                    "from_email": orphan_from,
+                    "to": to_list,
+                    "subject": orphan.get("subject", ""),
+                    "body": body or "",
+                    "body_html": body_html or "",
+                    "date": date_str,
+                    "preview": preview,
+                })
+
+            replies_to_push.extend(orphan.get("thread_replies", []))
+            sent_to_push.extend(orphan.get("sent_replies", []))
+            all_mids = [orphan_mid] + orphan.get("thread_message_ids", [])
+
+            update_ops: dict = {"$addToSet": {"thread_message_ids": {"$each": all_mids}}}
+            push_ops: dict = {}
+            if replies_to_push:
+                push_ops["thread_replies"] = {"$each": replies_to_push}
+            if sent_to_push:
+                push_ops["sent_replies"] = {"$each": sent_to_push}
+            if push_ops:
+                update_ops["$push"] = push_ops
+
+            email_metadata_col().update_one({"_id": parent_id}, update_ops)
+
+            parent_doc = email_metadata_col().find_one({"_id": parent_id})
+            odt = orphan.get("date")
+            if parent_doc and isinstance(odt, datetime):
+                pdt = parent_doc.get("date")
+                if pdt and not isinstance(pdt, datetime):
+                    pdt = None
+                if pdt and not pdt.tzinfo:
+                    pdt = pdt.replace(tzinfo=timezone.utc)
+                if odt and not odt.tzinfo:
+                    odt = odt.replace(tzinfo=timezone.utc)
+                if not pdt or (odt and odt > pdt):
+                    email_metadata_col().update_one(
+                        {"_id": parent_id},
+                        {"$set": {"date": odt, "read": False}},
+                    )
+
+            email_metadata_col().delete_one({"_id": orphan_id, "user_id": user_id})
+
+            try:
+                qdrant.delete(
+                    collection_name=settings.QDRANT_COLLECTION_EMAIL_CHUNKS,
+                    points_selector=Filter(must=[
+                        FieldCondition(key="email_id", match=MatchValue(value=orphan_id)),
+                        FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    ]),
+                )
+            except Exception:
+                pass
+            try:
+                follow_ups_col().delete_many({"user_id": user_id, "email_id": orphan_id})
+                email_attachments_col().delete_many({"email_id": orphan_id, "user_id": user_id})
+            except Exception:
+                pass
+
+            merged += 1
+            if orphan_mid and orphan_mid not in seen:
+                seen.add(orphan_mid)
+                queue.append(orphan_mid)
+            print(f"[SYNC] Adopted orphan '{orphan.get('subject', '?')}' into parent '{parent_id}'")
+
+    return merged
+
 
 def _backfill_attachments(existing_meta: dict, msg, user_id: str, mailbox_id: str):
     """If an existing email has attachments but no attachment data in Qdrant, extract and store it."""

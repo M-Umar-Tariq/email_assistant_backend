@@ -29,7 +29,8 @@ def top_senders(request):
 @api_view(["GET"])
 @jwt_required
 def categories(request):
-    return Response(services.get_categories(request.user_id))
+    days = int(request.query_params.get("days", 7))
+    return Response(services.get_categories(request.user_id, days))
 
 
 @api_view(["GET"])

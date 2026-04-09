@@ -1,7 +1,7 @@
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
-from database.db import email_metadata_col
+from database.db import email_metadata_col, user_settings_col
 from api.utils.qdrant_helpers import scroll_all_chunk0
 
 
@@ -58,18 +58,48 @@ def get_top_senders(user_id: str, limit: int = 10) -> list[dict]:
     ]
 
 
-def get_categories(user_id: str) -> list[dict]:
-    """Aggregate categories from Qdrant (content store)."""
-    all_emails = scroll_all_chunk0(user_id)
+def get_categories(user_id: str, days: int = 7) -> list[dict]:
+    """Aggregate user label usage from MongoDB email metadata in the last ``days`` days.
+
+    Only labels that appear in the user's ``ai_label_rules`` (by name, case-insensitive)
+    are counted. Emails may have multiple labels; each label on an email increments
+    that label's count once (slices sum to 100% as share of total label assignments).
+    """
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+
+    settings = user_settings_col().find_one({"user_id": user_id}) or {}
+    rules = settings.get("ai_label_rules") or []
+    name_by_lower: dict[str, str] = {}
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        name = (r.get("name") or "").strip()
+        if name:
+            name_by_lower[name.lower()] = name
+
+    if not name_by_lower:
+        return []
+
     counter: Counter = Counter()
-    for email in all_emails:
-        cat = email.get("category")
-        if cat:
-            counter[cat] += 1
+    for doc in email_metadata_col().find(
+        {"user_id": user_id, "date": {"$gte": start}},
+        {"labels": 1},
+    ):
+        labels = doc.get("labels") or []
+        if not isinstance(labels, list):
+            continue
+        for lab in labels:
+            s = str(lab).strip()
+            if not s:
+                continue
+            canonical = name_by_lower.get(s.lower())
+            if canonical:
+                counter[canonical] += 1
 
     return [
-        {"name": cat, "value": count}
-        for cat, count in counter.most_common()
+        {"name": label_name, "value": count}
+        for label_name, count in counter.most_common()
     ]
 
 

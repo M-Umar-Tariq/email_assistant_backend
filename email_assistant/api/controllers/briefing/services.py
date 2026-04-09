@@ -98,15 +98,19 @@ def get_briefing(user_id: str) -> dict:
 
 
 def _meeting_briefing_items(user_id: str, start_of_day: datetime) -> list[dict]:
-    """Upcoming today's calendar entries for the briefing list."""
+    """Today's calendar entries for the briefing list (excludes meetings already ended)."""
+    now = datetime.now(timezone.utc)
     end_of_day = start_of_day + timedelta(days=1)
     docs = list(
         meetings_col()
         .find(
             {
                 "user_id": user_id,
-                "start": {"$lt": end_of_day},
-                "end": {"$gt": start_of_day},
+                "$and": [
+                    {"start": {"$lt": end_of_day}},
+                    {"end": {"$gt": start_of_day}},
+                    {"end": {"$gt": now}},
+                ],
             }
         )
         .sort("start", 1)
