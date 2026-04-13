@@ -65,6 +65,25 @@ def refresh_tokens_col():
 def email_attachments_col():
     return get_db()["email_attachments"]
 
+
+def next_email_attachment_int_id() -> int:
+    """
+    Next integer `id` for email_attachments rows.
+
+    Djongo/Django may create a unique index on the ORM primary key field `id`.
+    Raw PyMongo upserts without `id` leave it null, so only one row can exist
+    (E11000 duplicate key { id: null }). Use $setOnInsert with this value.
+    """
+    col = email_attachments_col()
+    pipeline = [{"$group": {"_id": None, "max_id": {"$max": "$id"}}}]
+    rows = list(col.aggregate(pipeline))
+    if not rows or rows[0].get("max_id") is None:
+        return 1
+    try:
+        return int(rows[0]["max_id"]) + 1
+    except (TypeError, ValueError):
+        return 1
+
 def agent_profiles_col():
     return get_db()["agent_profiles"]
 

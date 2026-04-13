@@ -599,6 +599,21 @@ def get_attachment(user_id: str, email_id: str, attachment_index: int) -> dict |
     }
 
 
+def diagnose_missing_attachment(user_id: str, email_id: str, attachment_index: int) -> str:
+    """Return a human-readable reason why an attachment download failed."""
+    meta = email_metadata_col().find_one({"_id": email_id, "user_id": user_id})
+    if not meta:
+        return "email_not_found"
+    any_att = email_attachments_col().find_one({"email_id": email_id, "user_id": user_id})
+    if not any_att:
+        return "no_binary_data_stored_for_email"
+    stored = list(email_attachments_col().find(
+        {"email_id": email_id, "user_id": user_id}, {"index": 1, "filename": 1}
+    ))
+    indices = [s["index"] for s in stored]
+    return f"index_{attachment_index}_missing (stored indices: {indices})"
+
+
 def _merge_email(mongo_doc: dict, qdrant_content: dict) -> dict:
     """Merge MongoDB mutable state with Qdrant immutable content."""
     priority = mongo_doc.get("priority") or qdrant_content.get("priority", "medium")

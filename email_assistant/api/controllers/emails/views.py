@@ -188,7 +188,9 @@ def email_delete_sent_reply(request, email_id, reply_index):
 def email_attachment_download(request, email_id, attachment_index):
     att = services.get_attachment(request.user_id, email_id, int(attachment_index))
     if not att:
-        return Response({"error": "Attachment not found"}, status=status.HTTP_404_NOT_FOUND)
+        reason = services.diagnose_missing_attachment(request.user_id, email_id, int(attachment_index))
+        print(f"[DOWNLOAD] Attachment not found: email_id={email_id} index={attachment_index} reason={reason}")
+        return Response({"error": "Attachment not found", "detail": reason}, status=status.HTTP_404_NOT_FOUND)
     data = base64.b64decode(att["data_b64"])
     response = HttpResponse(data, content_type=att["content_type"])
     response["Content-Disposition"] = f'attachment; filename="{att["filename"]}"'

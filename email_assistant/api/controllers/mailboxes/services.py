@@ -16,7 +16,17 @@ from api.utils.attachment_text import extract_attachments_from_message
 from django.conf import settings
 from imapclient import IMAPClient
 
-from database.db import mailboxes_col, email_metadata_col, email_attachments_col, follow_ups_col, get_qdrant, ensure_qdrant_collection
+from database.db import (
+    mailboxes_col,
+    email_metadata_col,
+    email_attachments_col,
+    follow_ups_col,
+    meetings_col,
+    get_qdrant,
+    ensure_qdrant_collection,
+    next_email_attachment_int_id,
+)
+from api.controllers.calendar.services import recompute_conflicts_for_user
 from api.utils.encryption import encrypt, decrypt
 from api.utils.chunking import chunk_text
 from api.utils.embedding import embed_texts
@@ -36,10 +46,24 @@ def _imap_friendly_error(err_msg: str) -> str:
     return f"Connection failed: {err_msg}"
 
 
+def _connect_imap(imap_host: str, imap_port: int, imap_secure: bool) -> IMAPClient:
+    """Create an IMAPClient with SSL or STARTTLS depending on port and secure flag.
+
+    Port 993 + secure → implicit SSL.
+    Port 143 (or other) + secure → connect plain, then STARTTLS.
+    secure=False → plain connection, no encryption.
+    """
+    use_ssl = imap_secure and imap_port == 993
+    client = IMAPClient(imap_host, port=imap_port, ssl=use_ssl)
+    if imap_secure and not use_ssl:
+        client.starttls()
+    return client
+
+
 def verify_imap_connection(imap_host: str, imap_port: int, imap_secure: bool, username: str, password: str) -> None:
     """Verify IMAP credentials by connecting and selecting INBOX. Raises ValueError on failure."""
     try:
-        with IMAPClient(imap_host, port=imap_port, ssl=imap_secure) as client:
+        with _connect_imap(imap_host, imap_port, imap_secure) as client:
             client.login(username, password)
             client.select_folder("INBOX", readonly=True)
     except Exception as e:
@@ -127,10 +151,18 @@ def delete_mailbox(user_id: str, mailbox_id: str) -> bool:
     if result.deleted_count:
         # Delete follow-ups that reference emails from this mailbox (before we delete metadata)
         email_ids = list(email_metadata_col().distinct("_id", {"user_id": user_id, "mailbox_id": mailbox_id}))
-        if email_ids:
-            email_id_strs = [str(eid) for eid in email_ids]
+        email_id_strs = [str(eid) for eid in email_ids]
+        if email_id_strs:
             follow_ups_col().delete_many({"user_id": user_id, "email_id": {"$in": email_id_strs}})
+        # Calendar: manual meetings tagged with this mailbox + email-derived meetings for its messages
+        meet_or: list[dict] = [{"mailbox_id": mailbox_id}]
+        if email_id_strs:
+            meet_or.append({"email_id": {"$in": email_id_strs}})
+        removed_meetings = meetings_col().delete_many({"user_id": user_id, "$or": meet_or})
+        if removed_meetings.deleted_count:
+            recompute_conflicts_for_user(user_id)
         email_metadata_col().delete_many({"user_id": user_id, "mailbox_id": mailbox_id})
+        email_attachments_col().delete_many({"user_id": user_id, "mailbox_id": mailbox_id})
         _delete_qdrant_chunks_for_mailbox(user_id, mailbox_id)
     return result.deleted_count > 0
 
@@ -196,7 +228,7 @@ def sync_mailbox(
 
     # 1) Connect to IMAP & get message IDs (fast — no email data downloaded yet)
     try:
-        imap_client = IMAPClient(mb["imap_host"], port=mb["imap_port"], ssl=mb["imap_secure"])
+        imap_client = _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"])
         imap_client.login(mb["username"], password)
         imap_client.select_folder("INBOX", readonly=True)
         since = mb.get("last_sync_at")
@@ -653,18 +685,25 @@ def sync_mailbox(
                     # Store attachment binary data in MongoDB for download
                     for att_bin in email_data.get("attachment_binaries", []):
                         try:
-                            email_attachments_col().insert_one({
-                                "email_id": email_data["email_id"],
-                                "user_id": user_id,
-                                "mailbox_id": mailbox_id,
-                                "index": att_bin["index"],
-                                "filename": att_bin["filename"],
-                                "content_type": att_bin["content_type"],
-                                "size": att_bin["size"],
-                                "data_b64": att_bin["data_b64"],
-                            })
-                        except Exception:
-                            pass
+                            email_attachments_col().update_one(
+                                {"email_id": email_data["email_id"], "user_id": user_id, "index": att_bin["index"]},
+                                {
+                                    "$set": {
+                                        "email_id": email_data["email_id"],
+                                        "user_id": user_id,
+                                        "mailbox_id": mailbox_id,
+                                        "index": att_bin["index"],
+                                        "filename": att_bin["filename"],
+                                        "content_type": att_bin["content_type"],
+                                        "size": att_bin["size"],
+                                        "data_b64": att_bin["data_b64"],
+                                    },
+                                    "$setOnInsert": {"id": next_email_attachment_int_id()},
+                                },
+                                upsert=True,
+                            )
+                        except Exception as att_err:
+                            print(f"[SYNC] Failed to store attachment binary for email '{email_data['email_id']}' index {att_bin['index']}: {att_err}")
 
                     mtg = meeting_by_email_id.get(email_data["email_id"])
                     if mtg:
@@ -842,34 +881,13 @@ def _adopt_orphan_replies(
 
 
 def _backfill_attachments(existing_meta: dict, msg, user_id: str, mailbox_id: str):
-    """If an existing email has attachments but no attachment data in Qdrant, extract and store it."""
-    if not _has_attachment(msg):
-        return
+    """If an existing email has attachments but no binary data in MongoDB, extract and store it."""
     email_id = str(existing_meta["_id"])
     try:
         # Check if already backfilled
         already_stored = email_attachments_col().find_one({"email_id": email_id, "user_id": user_id})
         if already_stored:
             return
-
-        qdrant = get_qdrant()
-        results = qdrant.scroll(
-            collection_name=settings.QDRANT_COLLECTION_EMAIL_CHUNKS,
-            scroll_filter=Filter(
-                must=[
-                    FieldCondition(key="email_id", match=MatchValue(value=email_id)),
-                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
-                    FieldCondition(key="chunk_index", match=MatchValue(value=0)),
-                ]
-            ),
-            limit=1,
-            with_payload=True,
-            with_vectors=False,
-        )
-        points = results[0] if results else []
-        if not points:
-            return
-        point = points[0]
 
         attachments = extract_attachments_from_message(msg, include_binary=True)
         if not attachments:
@@ -886,35 +904,65 @@ def _backfill_attachments(existing_meta: dict, msg, user_id: str, mailbox_id: st
             for a in attachments
         ]
 
-        # Update Qdrant payload with text metadata
-        existing_attachments = point.payload.get("attachments")
-        if not existing_attachments or existing_attachments == "[]":
-            qdrant.set_payload(
+        # Update Qdrant payload with text metadata if missing
+        try:
+            qdrant = get_qdrant()
+            results = qdrant.scroll(
                 collection_name=settings.QDRANT_COLLECTION_EMAIL_CHUNKS,
-                payload={
-                    "attachments": json.dumps(attachment_meta),
-                    "attachment_text": attachment_text[:32000] if attachment_text else "",
-                },
-                points=[point.id],
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(key="email_id", match=MatchValue(value=email_id)),
+                        FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                        FieldCondition(key="chunk_index", match=MatchValue(value=0)),
+                    ]
+                ),
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
             )
+            points = results[0] if results else []
+            if points:
+                point = points[0]
+                existing_attachments = point.payload.get("attachments")
+                if not existing_attachments or existing_attachments == "[]":
+                    qdrant.set_payload(
+                        collection_name=settings.QDRANT_COLLECTION_EMAIL_CHUNKS,
+                        payload={
+                            "attachments": json.dumps(attachment_meta),
+                            "attachment_text": attachment_text[:32000] if attachment_text else "",
+                        },
+                        points=[point.id],
+                    )
+        except Exception as qdrant_err:
+            print(f"[SYNC] Qdrant metadata update failed for '{email_id}': {qdrant_err}")
 
-        # Store binary data in MongoDB for download
+        # Store binary data in MongoDB for download (upsert to be idempotent)
+        stored_count = 0
         for idx, a in enumerate(attachments):
             if a.get("data_b64"):
                 try:
-                    email_attachments_col().insert_one({
-                        "email_id": email_id,
-                        "user_id": user_id,
-                        "mailbox_id": mailbox_id,
-                        "index": idx,
-                        "filename": a["filename"],
-                        "content_type": a["content_type"],
-                        "size": a["size"],
-                        "data_b64": a["data_b64"],
-                    })
-                except Exception:
-                    pass
-        print(f"[SYNC] Backfilled attachments for email '{email_id}': {[a['filename'] for a in attachment_meta]}")
+                    email_attachments_col().update_one(
+                        {"email_id": email_id, "user_id": user_id, "index": idx},
+                        {
+                            "$set": {
+                                "email_id": email_id,
+                                "user_id": user_id,
+                                "mailbox_id": mailbox_id,
+                                "index": idx,
+                                "filename": a["filename"],
+                                "content_type": a["content_type"],
+                                "size": a["size"],
+                                "data_b64": a["data_b64"],
+                            },
+                            "$setOnInsert": {"id": next_email_attachment_int_id()},
+                        },
+                        upsert=True,
+                    )
+                    stored_count += 1
+                except Exception as att_err:
+                    print(f"[SYNC] Backfill binary insert failed for '{email_id}' index {idx}: {att_err}")
+        if stored_count:
+            print(f"[SYNC] Backfilled attachments for email '{email_id}': {[a['filename'] for a in attachment_meta]} ({stored_count} binaries stored)")
     except Exception as e:
         print(f"[SYNC] Attachment backfill failed for '{email_id}': {e}")
 
@@ -1082,7 +1130,7 @@ def set_email_read_on_imap(user_id: str, mailbox_id: str, message_id: str, read:
         return False
     try:
         password = decrypt(mb["encrypted_password"])
-        with IMAPClient(mb["imap_host"], port=mb["imap_port"], ssl=mb["imap_secure"]) as client:
+        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
             client.login(mb["username"], password)
             client.select_folder("INBOX")
             uids = _find_uids(client, message_id)
@@ -1112,7 +1160,7 @@ def set_email_starred_on_imap(user_id: str, mailbox_id: str, message_id: str, st
         return False
     try:
         password = decrypt(mb["encrypted_password"])
-        with IMAPClient(mb["imap_host"], port=mb["imap_port"], ssl=mb["imap_secure"]) as client:
+        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
             client.login(mb["username"], password)
             client.select_folder("INBOX")
             uids = _find_uids(client, message_id)
@@ -1135,7 +1183,7 @@ def _move_email_on_imap(user_id: str, mailbox_id: str, message_id: str, dest_fol
         return False
     try:
         password = decrypt(mb["encrypted_password"])
-        with IMAPClient(mb["imap_host"], port=mb["imap_port"], ssl=mb["imap_secure"]) as client:
+        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
             client.login(mb["username"], password)
             client.select_folder("INBOX")
             uids = _find_uids(client, message_id)
