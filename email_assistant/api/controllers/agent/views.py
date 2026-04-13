@@ -70,8 +70,8 @@ def speak(request):
     try:
         result = services.generate_speech(text)
         return Response(result)
-    except Exception as exc:
+    except Exception:
         return Response(
-            {"error": str(exc)},
+            {"error": "Speech generation failed. Please try again."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )

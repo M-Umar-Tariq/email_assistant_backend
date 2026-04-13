@@ -49,6 +49,33 @@ def _classify_email_limit(message: str) -> int:
         return 10
 
 
+_EMAIL_RAG_PATTERN = re.compile(
+    r"\b("
+    r"email|emails|e-mail|inbox|mailbox|mailboxes|unread|draft|drafts|reply|replies|forward|"
+    r"sent|trash|archive|spam|folder|message from|message to|write to|send (?:an? )?email|"
+    r"attachment|subject line|sender|recipient|newsletter|meeting invite|invoice"
+    r")\b",
+    re.I,
+)
+
+
+def _agent_needs_email_rag(message: str) -> bool:
+    """Pure chit-chat skips embedding, Qdrant, Cohere rerank, and the limit-classifier LLM."""
+    m = message.strip()
+    if len(m) > 160:
+        return True
+    if _EMAIL_RAG_PATTERN.search(m):
+        return True
+    if re.search(
+        r"\b(find|search|show (?:me )?|summari[sz]e|list (?:my )?|last|latest|recent|"
+        r"what did|who (?:wrote|sent)|anything from)\b",
+        m,
+        re.I,
+    ):
+        return True
+    return False
+
+
 # ── Agent chat ────────────────────────────────────────────────────────────────
 
 def agent_chat(
@@ -59,11 +86,18 @@ def agent_chat(
 ) -> dict:
     profile = get_profile(user_id)
 
-    email_limit = _classify_email_limit(message)
-
-    contents, metas = _fetch_emails_by_vector(
-        user_id, message, mailbox_id=mailbox_id, limit=email_limit
-    )
+    if _agent_needs_email_rag(message):
+        email_limit = _classify_email_limit(message)
+        contents, metas = _fetch_emails_by_vector(
+            user_id,
+            message,
+            mailbox_id=mailbox_id,
+            limit=email_limit,
+            search_chunk_limit=140,
+            rerank_cap=90,
+        )
+    else:
+        contents, metas = [], []
 
     mbox_docs = list(mailboxes_col().find({"user_id": user_id}))
     mailbox_info = [
@@ -103,75 +137,44 @@ def agent_chat(
     ]
 
     system_prompt = (
-        f"You are a personal AI assistant. Today is {now_str}.\n\n"
-        f"USER PROFILE (learned from their emails):\n{profile_summary}\n\n"
+        f"You are a real-time VOICE assistant for email. Today is {now_str}.\n"
+        "Your responses are spoken aloud via text-to-speech, so write exactly how a "
+        "friendly human would TALK — short sentences, natural rhythm, no markdown, no "
+        "bullet points, no asterisks, no numbered lists. Use commas and periods for "
+        "natural pauses. Keep answers under 3 sentences when possible.\n\n"
+        "VOICE STYLE:\n"
+        "- Talk like a helpful colleague, warm and concise.\n"
+        "- Never use formatting: no **, no ##, no - lists, no numbered lists.\n"
+        "- Say things like \"You got an email from Ahmed about the project deadline\" "
+        "not \"1. **Ahmed** - Subject: Project Deadline\".\n"
+        "- For multiple emails, briefly mention the top 2-3 and offer to go deeper.\n"
+        "- Use contractions: \"you've\", \"there's\", \"I'll\".\n"
+        "- Use filler-free but natural phrasing. Don't say \"certainly\" or \"absolutely\".\n\n"
+        f"USER PROFILE:\n{profile_summary}\n\n"
         + prefs_block +
         f"MAILBOXES:\n{json.dumps(mailbox_info, default=str)}\n\n"
-        f"KEY CONTACTS (use these to resolve spoken names to email addresses):\n"
-        f"{json.dumps(contacts_lookup, default=str)}\n\n"
-        f"RELEVANT EMAILS:\n{email_context or 'No relevant emails found.'}\n\n"
-        "EMAIL SUMMARIZATION:\n"
-        "- When the user asks about emails, "
-        "summarize the email CONTENT, not just subject/metadata.\n"
-        "- Give 1–2 concise lines per email: sender, subject, and the main gist or action items.\n"
-        "- If many emails match, group summaries by topic/sender and highlight urgent items.\n\n"
-        "CAPABILITIES — you can take real actions. When needed, include a JSON "
-        "block using this format:\n\n"
+        f"KEY CONTACTS:\n{json.dumps(contacts_lookup, default=str)}\n\n"
+        f"RELEVANT EMAILS:\n{email_context or 'None found.'}\n\n"
+        "ACTIONS — when needed, append a JSON block (the user won't see it, only the "
+        "spoken text before it). Format:\n"
         "```actions\n"
         '[{"type":"send_email","to":"x@y.com","subject":"...","body":"...",'
         '"mailbox_id":"...","label":"short desc","description":"details",'
         '"requires_approval":true}]\n'
-        "```\n\n"
-        "Action types:\n"
-        "- send_email: to (email or array), subject, body, mailbox_id (optional). "
-        "Example: {\"type\":\"send_email\",\"to\":\"ahmed@example.com\",\"subject\":\"...\",\"body\":\"...\",\"label\":\"...\",\"requires_approval\":true}\n"
-        "- forward_email: email_id, to (email or array), mailbox_id (optional), body (optional prefix). "
-        "Example: {\"type\":\"forward_email\",\"email_id\":\"...\",\"to\":\"someone@example.com\",\"label\":\"...\",\"requires_approval\":true}\n"
-        "- trash_email: email_id (move to trash/delete). "
-        "Example: {\"type\":\"trash_email\",\"email_id\":\"...\",\"label\":\"Move to trash\",\"requires_approval\":true}\n"
-        "- archive_email: email_id. "
-        "Example: {\"type\":\"archive_email\",\"email_id\":\"...\",\"label\":\"Archive email\",\"requires_approval\":true}\n"
-        "- mark_read: email_id (mark as read). "
-        "Example: {\"type\":\"mark_read\",\"email_id\":\"...\",\"label\":\"Mark as read\",\"requires_approval\":false}\n"
-        "- draft_reply (email_id,instructions) | send_reply (email_id,body or instructions,mailbox_id) | "
-        "send_whatsapp (to=phone,body) | set_reminder (hours,note)\n\n"
+        "```\n"
+        "Types: send_email, forward_email (needs email_id), trash_email, archive_email, "
+        "mark_read, draft_reply, send_reply, send_whatsapp, set_reminder.\n"
+        "Always set requires_approval=true for send/delete/trash/archive/forward.\n\n"
         "RULES:\n"
-        "1. Always requires_approval=true for sending emails/messages and for delete/trash/archive\n"
-        "2. Match the user's communication style from their profile\n"
-        "3. Be proactive — suggest actions when relevant\n"
-        "4. Reference specific emails by subject/sender and include a brief content summary\n"
-        "5. Respond in the same language the user speaks\n"
-        "6. Be concise but substantive\n"
-        "7. Use send_reply when the user wants to SEND a reply (e.g. 'reply to that email saying yes', "
-        "'send a reply to Ahmed'). Use draft_reply only when they want a draft to review first.\n"
-        "8. Use send_email for NEW emails (e.g. 'send an email to John about the meeting'). "
-        "Use forward_email when the user wants to FORWARD an existing email (e.g. 'forward that email to Sarah'). "
-        "Always include the relevant email_id for forward_email from RELEVANT EMAILS.\n"
-        "9. When the user says 'delete', 'remove', 'trash' or 'throw away' an email, use trash_email with email_id from RELEVANT EMAILS. "
-        "When they say 'archive' an email, use archive_email. When they say 'mark as read' or 'mark read', use mark_read.\n"
-        "10. SCOPE: You are strictly an EMAIL assistant. If the user asks about "
-        "anything unrelated to their emails, inbox, contacts, or email-related "
-        "tasks (e.g. general knowledge, coding, math, recipes, weather, etc.), "
-        "respond warmly and empathetically but gently redirect. Example: "
-        "\"That's a great question! But I'm your email assistant — I'm best at "
-        "helping you with your inbox, emails, and contacts. Is there anything "
-        "email-related I can help with?\"\n"
-        "11. SPEECH INPUT: User messages come from voice/speech recognition and "
-        "may contain errors — misspelled names, broken email addresses (spaces "
-        "in emails, 'at' instead of '@', 'dot' instead of '.'), or garbled "
-        "words. Use context and the user's known contacts from their profile to "
-        "infer the correct names, email addresses, and intent. If a user says "
-        "a name (e.g. 'send email to Ahmed'), look up their email from KEY CONTACTS below.\n"
-        "12. RECIPIENT RESOLUTION: **If multiple contacts share the same or similar name, "
-        "you MUST list ALL matching contacts with their email addresses and ask the user "
-        "to pick the correct one. NEVER auto-pick one silently.**\n"
-        "13. SENDER CONFIRMATION: Before emitting any send_email, send_reply, or forward_email "
-        "action, you MUST clearly state:\n"
-        "   - **From**: which mailbox/email address the email will be sent from\n"
-        "   - **To**: the recipient's full email address\n"
-        "   - **Subject** and a brief summary of the body\n"
-        "   If the user has multiple mailboxes, ask which one to send from. "
-        "Only emit the action block AFTER the user confirms these details or says 'send it'."
+        "1. VOICE FIRST: Every response must sound natural when spoken. No visual formatting.\n"
+        "2. BREVITY: 1-3 sentences for simple queries. Up to 5 for email summaries.\n"
+        "3. Speech input may have errors — infer names, emails, intent from context and KEY CONTACTS.\n"
+        "4. If multiple contacts share a name, ask the user to pick.\n"
+        "5. Before sending, confirm: from which mailbox, to whom, about what. Keep it spoken.\n"
+        "6. Respond in the same language the user speaks.\n"
+        "7. SCOPE: email assistant only. Gently redirect off-topic questions.\n"
+        "8. Use send_reply for replies, send_email for new messages, forward_email for forwards.\n"
+        "9. For delete/trash/archive/mark-read, use the matching action type with email_id."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -182,7 +185,8 @@ def agent_chat(
 
     messages.append({"role": "user", "content": message})
 
-    response_text = chat_multi(messages, temperature=0.5, max_tokens=2048)
+    max_out = 800 if contents else 250
+    response_text = chat_multi(messages, temperature=0.6, max_tokens=max_out)
 
     actions = _extract_actions(response_text)
     clean_text = _clean_response(response_text)
@@ -291,9 +295,10 @@ def generate_speech(text: str) -> dict:
 
     client = OpenAI(api_key=django_settings.OPENAI_API_KEY)
     response = client.audio.speech.create(
-        model=getattr(django_settings, "OPENAI_TTS_MODEL", "tts-1"),
+        model=getattr(django_settings, "OPENAI_TTS_MODEL", "tts-1-hd"),
         voice=getattr(django_settings, "OPENAI_TTS_VOICE", "nova"),
         input=text[:4096],
+        speed=1.05,
     )
     audio_b64 = base64.b64encode(response.content).decode("utf-8")
     return {"audio": audio_b64, "format": "mp3"}

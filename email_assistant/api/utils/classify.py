@@ -75,12 +75,18 @@ def _assign_labels_batch(
             cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
         parsed = json.loads(cleaned)
-        if isinstance(parsed, list) and len(parsed) == len(batch):
+        if isinstance(parsed, list):
             valid_set = set(label_names)
-            return [
-                [lbl for lbl in (item if isinstance(item, list) else []) if lbl in valid_set]
-                for item in parsed
-            ]
+            out: list[list[str]] = []
+            for idx in range(len(batch)):
+                if idx < len(parsed):
+                    item = parsed[idx]
+                    out.append(
+                        [lbl for lbl in (item if isinstance(item, list) else []) if lbl in valid_set]
+                    )
+                else:
+                    out.append([])
+            return out
     except Exception as exc:
         logger.warning("AI label assignment failed: %s", exc)
 

@@ -507,15 +507,17 @@ def sync_mailbox(
                 else:
                     ai_classifications.append({"priority": "medium", "category": None})
 
-            # 3d) Custom label assignment using user's ai_label_rules
+            # 3d) Custom label assignment using user's ai_label_rules (respect auto_labeling)
             try:
                 from api.controllers.settings.services import get_settings as _get_settings
                 _user_settings = _get_settings(user_id)
                 _label_rules = _user_settings.get("ai_label_rules") or []
+                _auto_labeling = bool(_user_settings.get("auto_labeling", True))
             except Exception:
                 _label_rules = []
+                _auto_labeling = True
 
-            if _label_rules:
+            if _label_rules and _auto_labeling:
                 _emails_for_labelling = [
                     {"subject": e["subject"], "from_name": e["from_name"], "from_email": e["from_email"], "preview": e["preview"]}
                     for e in parsed_batch
@@ -584,6 +586,17 @@ def sync_mailbox(
                         email_metadata_col().insert_one(meta_doc)
                     except DuplicateKeyError:
                         skipped += 1
+                        if _label_rules and _auto_labeling and email_labels:
+                            existing = email_metadata_col().find_one(
+                                {"_id": email_data["email_id"], "user_id": user_id},
+                                {"labels": 1},
+                            )
+                            prev = (existing or {}).get("labels")
+                            if not prev:
+                                email_metadata_col().update_one(
+                                    {"_id": email_data["email_id"], "user_id": user_id},
+                                    {"$set": {"labels": email_labels}},
+                                )
                         continue
 
                     orphan_count = _adopt_orphan_replies(

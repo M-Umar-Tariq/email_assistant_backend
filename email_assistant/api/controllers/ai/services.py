@@ -248,8 +248,15 @@ def _fetch_emails_by_vector(
     query: str,
     mailbox_id: str | None = None,
     limit: int | None = None,
+    *,
+    search_chunk_limit: int = 500,
+    rerank_cap: int | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """Vector search + rerank, returns (contents, metas) deduplicated by email. limit=None means no limit."""
+    """Vector search + rerank, returns (contents, metas) deduplicated by email. limit=None means no limit.
+
+    search_chunk_limit caps Qdrant hits (default 500 for deep inbox search).
+    rerank_cap caps Cohere rerank input; None means rerank all retrieved chunks (slow at scale).
+    """
     query_vector = embed_text(query)
 
     must_filters = [FieldCondition(key="user_id", match=MatchValue(value=user_id))]
@@ -261,7 +268,7 @@ def _fetch_emails_by_vector(
         collection_name=settings.QDRANT_COLLECTION_EMAIL_CHUNKS,
         query=query_vector,
         query_filter=Filter(must=must_filters),
-        limit=500,
+        limit=max(1, min(search_chunk_limit, 500)),
         with_payload=True,
     )
     search_results = search_response.points
@@ -276,7 +283,8 @@ def _fetch_emails_by_vector(
         for r in search_results
     ]
 
-    reranked = rerank(query, documents, top_n=len(documents))
+    rerank_top = len(documents) if rerank_cap is None else min(rerank_cap, len(documents))
+    reranked = rerank(query, documents, top_n=max(1, rerank_top))
 
     seen_ids: list[str] = []
     payload_map: dict[str, dict] = {}

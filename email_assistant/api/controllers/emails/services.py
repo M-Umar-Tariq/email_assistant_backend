@@ -378,6 +378,33 @@ def send_email(user_id: str, data: dict) -> dict:
         "created_at": now,
     })
 
+    try:
+        from api.controllers.settings.services import get_settings as _get_settings
+        from api.utils.classify import assign_labels_batch
+
+        _settings = _get_settings(user_id)
+        if _settings.get("auto_labeling", True):
+            _rules = _settings.get("ai_label_rules") or []
+            if _rules:
+                sent_labels = assign_labels_batch(
+                    [
+                        {
+                            "subject": data["subject"],
+                            "from_name": mb.get("name", ""),
+                            "from_email": mb["email"],
+                            "preview": body_preview,
+                        }
+                    ],
+                    _rules,
+                )
+                if sent_labels and sent_labels[0]:
+                    email_metadata_col().update_one(
+                        {"_id": sent_id, "user_id": user_id},
+                        {"$set": {"labels": sent_labels[0]}},
+                    )
+    except Exception:
+        pass
+
     return {"status": "sent", "to": data["to"], "subject": data["subject"]}
 
 
