@@ -304,6 +304,34 @@ def generate_speech(text: str) -> dict:
     return {"audio": audio_b64, "format": "mp3"}
 
 
+# ── Speech-to-text (Whisper) ──────────────────────────────────────────────────
+
+def transcribe_audio(audio_file) -> dict:
+    """Transcribe an uploaded audio file using OpenAI Whisper."""
+    import tempfile
+    import os
+    from openai import OpenAI
+
+    client = OpenAI(api_key=django_settings.OPENAI_API_KEY)
+
+    ext = os.path.splitext(audio_file.name)[1] or ".webm"
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        for chunk in audio_file.chunks():
+            tmp.write(chunk)
+        tmp_path = tmp.name
+
+    try:
+        with open(tmp_path, "rb") as f:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                language="en",
+            )
+        return {"text": transcript.text.strip()}
+    finally:
+        os.unlink(tmp_path)
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _format_profile(profile: dict) -> str:

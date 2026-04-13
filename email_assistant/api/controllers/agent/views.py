@@ -1,4 +1,5 @@
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, parser_classes
+from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
 from rest_framework import status
 
@@ -73,5 +74,25 @@ def speak(request):
     except Exception:
         return Response(
             {"error": "Speech generation failed. Please try again."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@api_view(["POST"])
+@parser_classes([MultiPartParser, FormParser])
+@jwt_required
+def transcribe(request):
+    audio_file = request.FILES.get("audio")
+    if not audio_file:
+        return Response(
+            {"error": "audio file is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        result = services.transcribe_audio(audio_file)
+        return Response(result)
+    except Exception:
+        return Response(
+            {"error": "Transcription failed. Please try again."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )

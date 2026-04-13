@@ -9,4 +9,5 @@ urlpatterns = [
     path("execute/", views.execute, name="agent-execute"),
     path("reject/<str:action_id>/", views.reject, name="agent-reject"),
     path("speak/", views.speak, name="agent-speak"),
+    path("transcribe/", views.transcribe, name="agent-transcribe"),
 ]
