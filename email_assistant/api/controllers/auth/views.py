@@ -15,6 +15,7 @@ from api.middleware import (
     blacklist_refresh_token,
     jwt_required,
 )
+from api.controllers.admin import services as admin_services
 from . import services
 
 
@@ -102,3 +103,15 @@ def me(request):
         return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
     user = services.update_user(request.user_id, ser.validated_data)
     return Response(user)
+
+
+@api_view(["POST"])
+@jwt_required
+def delete_account(request):
+    """Permanently delete the authenticated user and all associated DB + Qdrant data."""
+    if not admin_services.delete_user(request.user_id):
+        return Response(
+            {"error": "Account could not be deleted"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(status=status.HTTP_204_NO_CONTENT)

@@ -9,22 +9,82 @@ from bson import ObjectId
 from django.conf import settings
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
-from database.db import email_metadata_col, mailboxes_col, follow_ups_col, email_attachments_col, get_qdrant
+from database.db import (
+    email_metadata_col,
+    mailboxes_col,
+    follow_ups_col,
+    email_attachments_col,
+    meetings_col,
+    get_qdrant,
+)
 from api.utils.encryption import decrypt
 from api.utils.email_body import clean_email_body
 from api.utils.qdrant_helpers import get_email_content, get_emails_content_batch, get_email_ids_by_sender, scroll_all_chunk0
 from api.controllers.mailboxes import services as mailbox_services
 
+_INBOX_PRESET_KEYS = frozenset({
+    "today",
+    "today_unread",
+    "today_replied",
+    "today_unreplied",
+    "total_unread",
+    "total_replied",
+    "total_unreplied",
+})
+
+
+def _utc_start_of_day(dt: datetime) -> datetime:
+    return dt.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _today_received_filter(now: datetime) -> dict:
+    """Emails received on the current UTC calendar day (matches list + stats)."""
+    start = _utc_start_of_day(now)
+    return {"$or": [
+        {"original_date": {"$gte": start}},
+        {"original_date": None, "date": {"$gte": start}},
+    ]}
+
+
+def _not_replied_filter() -> dict:
+    return {"$or": [{"replied_at": None}, {"replied_at": {"$exists": False}}]}
+
+
+def _apply_inbox_preset_to_query(query: dict, preset: str, now: datetime) -> None:
+    """Mutate inbox query with $and / read filters (same semantics as email_stats)."""
+    ands: list = list(query.get("$and", []))
+    today_f = _today_received_filter(now)
+    if preset == "today":
+        ands.append(today_f)
+    elif preset == "today_unread":
+        ands.append(today_f)
+        query["read"] = False
+    elif preset == "today_replied":
+        ands.append(today_f)
+        ands.append({"replied_at": {"$ne": None}})
+    elif preset == "today_unreplied":
+        ands.append(today_f)
+        ands.append(_not_replied_filter())
+    elif preset == "total_unread":
+        query["read"] = False
+    elif preset == "total_replied":
+        ands.append({"replied_at": {"$ne": None}})
+    elif preset == "total_unreplied":
+        ands.append(_not_replied_filter())
+    query["$and"] = ands
+
 
 # ── List ─────────────────────────────────────────────────────────────────────
 
-def email_stats(user_id: str) -> dict:
+def email_stats(user_id: str, mailbox_id: str | None = None) -> dict:
     """Return email counts directly from MongoDB — no Qdrant fetch, no limit cap."""
     base_q: dict = {"user_id": user_id, "archived": False, "trashed": False}
+    if mailbox_id:
+        base_q["mailbox_id"] = mailbox_id
     now = datetime.now(timezone.utc)
     snooze_filter = {"$or": [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}]}
 
-    start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_today = _utc_start_of_day(now)
     today_date_filter = {"$or": [
         {"original_date": {"$gte": start_of_today}},
         {"original_date": None, "date": {"$gte": start_of_today}},
@@ -142,10 +202,15 @@ def list_emails(
     category: str | None = None,
     unread_only: bool = False,
     from_email: str | None = None,
+    subject: str | None = None,
+    keywords: str | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
     label: str | None = None,
     folder: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    inbox_preset: str | None = None,
 ) -> list[dict]:
     now = datetime.now(timezone.utc)
 
@@ -172,10 +237,38 @@ def list_emails(
 
     if mailbox_id:
         query["mailbox_id"] = mailbox_id
-    if unread_only:
+
+    allow_inbox_preset = folder in (None, "", "inbox")
+    preset_key = (inbox_preset or "").strip()
+    if preset_key in _INBOX_PRESET_KEYS and allow_inbox_preset:
+        _apply_inbox_preset_to_query(query, preset_key, now)
+    elif unread_only:
         query["read"] = False
+
     if label:
         query["labels"] = label
+
+    if subject and subject.strip():
+        query["subject"] = {"$regex": subject.strip(), "$options": "i"}
+
+    if keywords and keywords.strip():
+        kw_or = {
+            "$or": [
+                {"subject": {"$regex": keywords.strip(), "$options": "i"}},
+                {"preview": {"$regex": keywords.strip(), "$options": "i"}},
+            ]
+        }
+        existing_and = list(query.get("$and", []))
+        existing_and.append(kw_or)
+        query["$and"] = existing_and
+
+    if date_from or date_to:
+        date_range: dict = {}
+        if date_from:
+            date_range["$gte"] = date_from
+        if date_to:
+            date_range["$lte"] = date_to
+        query["date"] = date_range
 
     # Pre-filter email IDs from Qdrant when filtering by category or sender
     id_filter: list[str] | None = None
@@ -254,6 +347,76 @@ def get_email(user_id: str, email_id: str) -> dict | None:
 
 # ── Update metadata ──────────────────────────────────────────────────────────
 
+def _sync_read_to_imap(user_id: str, meta: dict, read: bool) -> None:
+    mailbox_services.set_email_read_on_imap(
+        user_id, meta["mailbox_id"], meta["message_id"], read
+    )
+    for tmid in meta.get("thread_message_ids", []):
+        mailbox_services.set_email_read_on_imap(
+            user_id, meta["mailbox_id"], tmid, read
+        )
+
+
+def mark_all_inbox_read(user_id: str, mailbox_id: str | None = None) -> dict:
+    """Mark every unread message in the inbox as read (MongoDB + IMAP per message)."""
+    query = _inbox_scope_query(user_id, mailbox_id)
+    query["read"] = False
+
+    col = email_metadata_col()
+    marked = 0
+    failed = 0
+    for meta in col.find(query):
+        try:
+            col.update_one(
+                {"_id": meta["_id"], "user_id": user_id},
+                {"$set": {"read": True}},
+            )
+            _sync_read_to_imap(user_id, meta, True)
+            marked += 1
+        except Exception:
+            failed += 1
+    return {"marked": marked, "failed": failed}
+
+
+def _inbox_scope_query(user_id: str, mailbox_id: str | None) -> dict:
+    """Same inbox scope as list_emails (default folder): non-archived, non-trash, not sent-only, snooze not hiding."""
+    now = datetime.now(timezone.utc)
+    query: dict = {
+        "user_id": user_id,
+        "archived": False,
+        "trashed": False,
+        "$or": [{"is_sent": {"$ne": True}}, {"is_sent": {"$exists": False}}],
+    }
+    query["$and"] = [
+        {"$or": query.pop("$or")},
+        {"$or": [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}]},
+    ]
+    if mailbox_id:
+        query["mailbox_id"] = mailbox_id
+    return query
+
+
+def mark_all_inbox_unread(user_id: str, mailbox_id: str | None = None) -> dict:
+    """Mark every currently-read inbox message as unread (MongoDB + IMAP per message)."""
+    q = _inbox_scope_query(user_id, mailbox_id)
+    q["read"] = True
+
+    col = email_metadata_col()
+    marked = 0
+    failed = 0
+    for meta in col.find(q):
+        try:
+            col.update_one(
+                {"_id": meta["_id"], "user_id": user_id},
+                {"$set": {"read": False}},
+            )
+            _sync_read_to_imap(user_id, meta, False)
+            marked += 1
+        except Exception:
+            failed += 1
+    return {"marked": marked, "failed": failed}
+
+
 def update_email(user_id: str, email_id: str, data: dict) -> dict | None:
     meta = email_metadata_col().find_one({"_id": email_id, "user_id": user_id})
     if not meta:
@@ -262,14 +425,7 @@ def update_email(user_id: str, email_id: str, data: dict) -> dict | None:
         {"_id": email_id, "user_id": user_id}, {"$set": data}
     )
     if "read" in data:
-        mailbox_services.set_email_read_on_imap(
-            user_id, meta["mailbox_id"], meta["message_id"], data["read"]
-        )
-        # Also mark all thread reply message_ids as read/unread on IMAP
-        for tmid in meta.get("thread_message_ids", []):
-            mailbox_services.set_email_read_on_imap(
-                user_id, meta["mailbox_id"], tmid, data["read"]
-            )
+        _sync_read_to_imap(user_id, meta, data["read"])
     if "starred" in data:
         mailbox_services.set_email_starred_on_imap(
             user_id, meta["mailbox_id"], meta["message_id"], data["starred"]
@@ -326,6 +482,36 @@ def spam_email(user_id: str, email_id: str) -> bool:
             user_id, meta["mailbox_id"], meta["message_id"]
         )
     return r.modified_count > 0
+
+
+def delete_email(user_id: str, email_id: str) -> bool:
+    """Permanently delete an email and related local records."""
+    meta = email_metadata_col().find_one({"_id": email_id, "user_id": user_id})
+    if not meta:
+        return False
+
+    mailbox_services.trash_email_on_imap(
+        user_id, meta["mailbox_id"], meta["message_id"]
+    )
+
+    email_metadata_col().delete_one({"_id": email_id, "user_id": user_id})
+    email_attachments_col().delete_many({"email_id": email_id, "user_id": user_id})
+    follow_ups_col().delete_many({"email_id": email_id, "user_id": user_id})
+    meetings_col().delete_many({"email_id": email_id, "user_id": user_id})
+
+    try:
+        get_qdrant().delete(
+            collection_name=settings.QDRANT_COLLECTION_EMAIL_CHUNKS,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    FieldCondition(key="email_id", match=MatchValue(value=email_id)),
+                ]
+            ),
+        )
+    except Exception:
+        pass
+    return True
 
 
 # ── Send / Reply / Forward via SMTP ─────────────────────────────────────────
@@ -523,10 +709,27 @@ def delete_sent_reply(user_id: str, email_id: str, reply_index: int) -> dict | N
 # ── Delete all ───────────────────────────────────────────────────────────────
 
 def delete_all_emails(user_id: str) -> dict:
-    """Delete all email state (MongoDB) and content (Qdrant) for the user."""
+    """Delete all synced email data (MongoDB) and vectors (Qdrant) for the user.
+
+    Mailboxes and account settings are unchanged. Removes attachments and
+    email-derived calendar rows; manual meetings are kept.
+    """
+    from api.controllers.calendar.services import recompute_conflicts_for_user
+
     result = email_metadata_col().delete_many({"user_id": user_id})
     deleted_count = result.deleted_count
     follow_ups_col().delete_many({"user_id": user_id})
+    email_attachments_col().delete_many({"user_id": user_id})
+    meetings_col().delete_many(
+        {
+            "user_id": user_id,
+            "$or": [
+                {"source": "email"},
+                {"email_id": {"$exists": True, "$nin": [None, ""]}},
+            ],
+        }
+    )
+    recompute_conflicts_for_user(user_id)
     try:
         qdrant = get_qdrant()
         qdrant.delete(
@@ -618,6 +821,9 @@ def _merge_email(mongo_doc: dict, qdrant_content: dict) -> dict:
     """Merge MongoDB mutable state with Qdrant immutable content."""
     priority = mongo_doc.get("priority") or qdrant_content.get("priority", "medium")
     thread_count = 1 + len(mongo_doc.get("thread_replies", [])) + len(mongo_doc.get("sent_replies", []))
+    od = mongo_doc.get("original_date")
+    if isinstance(od, datetime):
+        od = od.isoformat()
     return {
         "id": str(mongo_doc["_id"]),
         "mailbox_id": mongo_doc.get("mailbox_id", ""),
@@ -626,6 +832,7 @@ def _merge_email(mongo_doc: dict, qdrant_content: dict) -> dict:
         "from_email": qdrant_content.get("from_email") or mongo_doc.get("from_email", ""),
         "to": qdrant_content.get("to") or mongo_doc.get("to", []),
         "date": mongo_doc.get("date"),
+        "original_date": od,
         "preview": qdrant_content.get("preview") or mongo_doc.get("preview", ""),
         "read": mongo_doc.get("read", False),
         "starred": mongo_doc.get("starred", False),

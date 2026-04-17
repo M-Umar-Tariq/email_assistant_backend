@@ -1,4 +1,5 @@
 import base64
+from datetime import datetime
 
 from django.http import HttpResponse
 from rest_framework.decorators import api_view
@@ -15,6 +16,15 @@ from database.serializers.email_serializers import (
 from . import services
 
 
+def _parse_iso_dt(value: str | None):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 @api_view(["POST"])
 @jwt_required
 def email_delete_all(request):
@@ -22,10 +32,35 @@ def email_delete_all(request):
     return Response(result)
 
 
+@api_view(["POST"])
+@jwt_required
+def email_mark_all_read(request):
+    """Body/query: optional mailbox_id to scope to one mailbox."""
+    mb = request.data.get("mailbox_id") if request.data else None
+    if mb is None:
+        mb = request.query_params.get("mailbox_id")
+    result = services.mark_all_inbox_read(request.user_id, mailbox_id=mb or None)
+    return Response(result)
+
+
+@api_view(["POST"])
+@jwt_required
+def email_mark_all_unread(request):
+    """Body/query: optional mailbox_id to scope to one mailbox."""
+    mb = request.data.get("mailbox_id") if request.data else None
+    if mb is None:
+        mb = request.query_params.get("mailbox_id")
+    result = services.mark_all_inbox_unread(request.user_id, mailbox_id=mb or None)
+    return Response(result)
+
+
 @api_view(["GET"])
 @jwt_required
 def email_stats(request):
-    data = services.email_stats(request.user_id)
+    data = services.email_stats(
+        request.user_id,
+        mailbox_id=request.query_params.get("mailbox_id") or None,
+    )
     return Response(data)
 
 
@@ -52,16 +87,23 @@ def email_folder_counts(request):
 @api_view(["GET"])
 @jwt_required
 def email_list(request):
+    date_from = _parse_iso_dt(request.query_params.get("date_from"))
+    date_to = _parse_iso_dt(request.query_params.get("date_to"))
     data = services.list_emails(
         user_id=request.user_id,
         mailbox_id=request.query_params.get("mailbox_id"),
         category=request.query_params.get("category"),
         unread_only=request.query_params.get("unread_only", "").lower() == "true",
         from_email=request.query_params.get("from_email") or None,
+        subject=request.query_params.get("subject") or None,
+        keywords=request.query_params.get("keywords") or None,
+        date_from=date_from,
+        date_to=date_to,
         label=request.query_params.get("label") or None,
         folder=request.query_params.get("folder") or None,
         limit=int(request.query_params.get("limit", 50)),
         offset=int(request.query_params.get("offset", 0)),
+        inbox_preset=request.query_params.get("inbox_preset") or None,
     )
     return Response(data)
 
@@ -124,6 +166,15 @@ def email_spam(request, email_id):
     if not ok:
         return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
     return Response({"status": "spam"})
+
+
+@api_view(["POST"])
+@jwt_required
+def email_delete(request, email_id):
+    ok = services.delete_email(request.user_id, email_id)
+    if not ok:
+        return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+    return Response({"status": "deleted"})
 
 
 @api_view(["POST"])

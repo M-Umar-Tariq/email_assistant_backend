@@ -187,20 +187,50 @@ def sync_mailbox(
 ) -> dict:
     """
     Fetch emails from IMAP, then store them.
-    - initial_sync "only_new": set last_sync_at to now, do not fetch (only new emails later).
-    - initial_sync "last_n" with limit: fetch only the newest `limit` emails.
-    - initial_sync "all" or None: full sync (or incremental if last_sync_at set).
+    - initial_sync "only_new": no backfill; set IMAP UID watermark so later syncs fetch only new UIDs.
+    - initial_sync "last_n" with limit: fetch only the newest `limit` emails, then future default syncs are new-UID only.
+    - initial_sync "all": full INBOX scan (and flag merge); clears new-UID-only mode until another last_n / only_new.
+    - initial_sync None: if mailbox is in new-UID-only mode, fetch only UIDs above the watermark; else full INBOX scan.
     """
     mb = mailboxes_col().find_one({"_id": ObjectId(mailbox_id), "user_id": user_id})
     if not mb:
         raise ValueError("Mailbox not found")
 
-    # Only new: no IMAP fetch, just set last_sync_at so future syncs get only new mail
+    # Only new: no message backfill — record current INBOX UID watermark so later syncs are incremental by UID.
     if initial_sync == "only_new":
-        mailboxes_col().update_one(
-            {"_id": mb["_id"]},
-            {"$set": {"last_sync_at": datetime.now(timezone.utc), "sync_status": "synced"}},
-        )
+        password = decrypt(mb["encrypted_password"])
+        imap_client = None
+        try:
+            imap_client = _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"])
+            imap_client.login(mb["username"], password)
+            folder_meta = imap_client.select_folder("INBOX", readonly=True)
+            uidvalidity = folder_meta.get(b"UIDVALIDITY")
+            uid_next = folder_meta.get(b"UIDNEXT")
+            exists = int(folder_meta.get(b"EXISTS", 0) or 0)
+            last_uid = (int(uid_next) - 1) if uid_next is not None and exists > 0 else 0
+            set_doc = {
+                "last_sync_at": datetime.now(timezone.utc),
+                "sync_status": "synced",
+                "sync_uid_scope": "new_since_uid",
+                "imap_last_seen_max_uid": last_uid,
+            }
+            if uidvalidity is not None:
+                set_doc["imap_uidvalidity"] = int(uidvalidity)
+            mailboxes_col().update_one({"_id": mb["_id"]}, {"$set": set_doc})
+        except Exception as e:
+            err_msg = str(e).strip()
+            if "LOGIN" in err_msg or "BAD" in err_msg or "AUTHENTICATIONFAILED" in err_msg.upper():
+                raise RuntimeError(
+                    "IMAP login failed. Check that the username is your full email and the password is correct. "
+                    "For Gmail, use an App Password (not your normal password). For Outlook, enable IMAP and use your password or app password."
+                )
+            raise RuntimeError(f"IMAP failed: {e}")
+        finally:
+            if imap_client is not None:
+                try:
+                    imap_client.logout()
+                except Exception:
+                    pass
         total = email_metadata_col().count_documents({"user_id": user_id, "mailbox_id": mailbox_id})
         return {"synced": 0, "total": total, "total_fetched": 0}
 
@@ -216,7 +246,14 @@ def sync_mailbox(
                 {"sync_started_at": {"$lte": stale_cutoff}},
             ],
         },
-        {"$set": {"sync_status": "syncing", "sync_started_at": now}},
+        {
+            "$set": {
+                "sync_status": "syncing",
+                "sync_started_at": now,
+                "sync_total_fetched": 0,
+                "sync_processed": 0,
+            }
+        },
     )
     if not locked:
         total = email_metadata_col().count_documents({"user_id": user_id, "mailbox_id": mailbox_id})
@@ -230,23 +267,63 @@ def sync_mailbox(
     try:
         imap_client = _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"])
         imap_client.login(mb["username"], password)
-        imap_client.select_folder("INBOX", readonly=True)
-        since = mb.get("last_sync_at")
-        if initial_sync in ("last_n", "all"):
-            criteria = ["ALL"]
-        else:
-            criteria = ["SINCE", since.strftime("%d-%b-%Y")] if since else ["ALL"]
-        msg_ids = imap_client.search(criteria)
-        if not msg_ids:
+        folder_meta = imap_client.select_folder("INBOX", readonly=True)
+        uidvalidity = folder_meta.get(b"UIDVALIDITY")
+        stored_v = mb.get("imap_uidvalidity")
+        uid_mismatch = (
+            stored_v is not None
+            and uidvalidity is not None
+            and int(stored_v) != int(uidvalidity)
+        )
+
+        all_msg_ids = imap_client.search(["ALL"])
+        if not all_msg_ids:
             imap_client.logout()
             total_after = email_metadata_col().count_documents({"user_id": user_id, "mailbox_id": mailbox_id})
             _finish_sync(mb["_id"], 0)
             return {"synced": 0, "total": total_after, "total_fetched": 0}
+
+        folder_max_uid = max(all_msg_ids)
+        used_uid_incremental = False
+
         if initial_sync == "last_n" and limit is not None and limit > 0:
-            msg_ids = msg_ids[-limit:]
+            msg_ids = all_msg_ids[-limit:]
+        elif uid_mismatch:
+            # Folder was recreated / migrated — rescan everything and drop incremental constraints for this run.
+            msg_ids = list(all_msg_ids)
+        elif (
+            initial_sync is None
+            and mb.get("sync_uid_scope") == "new_since_uid"
+            and mb.get("imap_last_seen_max_uid") is not None
+        ):
+            lo = int(mb["imap_last_seen_max_uid"])
+            msg_ids = imap_client.search(["UID", f"{lo + 1}:*"])
+            used_uid_incremental = True
+        else:
+            # Full INBOX: merge read/star flags for every tracked message (legacy / explicit full sync).
+            msg_ids = list(all_msg_ids)
+
+        if not msg_ids:
+            imap_client.logout()
+            total_after = email_metadata_col().count_documents({"user_id": user_id, "mailbox_id": mailbox_id})
+            extra_finish: dict = {}
+            if uidvalidity is not None:
+                extra_finish["imap_uidvalidity"] = int(uidvalidity)
+            if uid_mismatch:
+                extra_finish["sync_uid_scope"] = None
+                extra_finish["imap_last_seen_max_uid"] = folder_max_uid
+            elif used_uid_incremental:
+                extra_finish["imap_last_seen_max_uid"] = int(mb["imap_last_seen_max_uid"])
+            _finish_sync(mb["_id"], 0, extra_finish or None)
+            return {"synced": 0, "total": total_after, "total_fetched": 0}
+
         # Process newest emails first (IMAP returns UIDs oldest-first by default)
         msg_ids = list(reversed(msg_ids))
         total_fetched = len(msg_ids)
+        mailboxes_col().update_one(
+            {"_id": mb["_id"]},
+            {"$set": {"sync_total_fetched": total_fetched, "sync_processed": 0}},
+        )
     except Exception as e:
         mailboxes_col().update_one(
             {"_id": mb["_id"]}, {"$set": {"sync_status": "error", "sync_started_at": None}}
@@ -273,6 +350,7 @@ def sync_mailbox(
     qdrant = get_qdrant()
 
     try:
+        processed_count = 0
         for batch_start in range(0, len(msg_ids), IMAP_BATCH):
             if _is_sync_cancelled(mb["_id"]):
                 print(f"[SYNC] Cancelled by user after {synced_count} emails")
@@ -285,7 +363,17 @@ def sync_mailbox(
                 fetched_batch = list(imap_client.fetch(batch_ids, ["RFC822", "FLAGS"]).items())
             except Exception:
                 traceback.print_exc()
+                processed_count = min(total_fetched, processed_count + len(batch_ids))
+                mailboxes_col().update_one(
+                    {"_id": mb["_id"]},
+                    {"$set": {"sync_processed": processed_count, "sync_total_fetched": total_fetched}},
+                )
                 continue
+            processed_count = min(total_fetched, processed_count + len(batch_ids))
+            mailboxes_col().update_one(
+                {"_id": mb["_id"]},
+                {"$set": {"sync_processed": processed_count, "sync_total_fetched": total_fetched}},
+            )
 
             # 3b) First pass: extract message IDs from raw emails
             raw_emails = []
@@ -305,7 +393,7 @@ def sync_mailbox(
             batch_mids = [item[3] for item in raw_emails]
             existing_docs = list(email_metadata_col().find(
                 {"user_id": user_id, "mailbox_id": mailbox_id, "message_id": {"$in": batch_mids}},
-                {"message_id": 1, "read": 1, "starred": 1, "replied_at": 1, "date": 1},
+                {"message_id": 1, "read": 1, "starred": 1, "replied_at": 1, "date": 1, "imap_uid": 1, "reply_count": 1},
             ))
             existing_map = {doc["message_id"]: doc for doc in existing_docs}
             # Also skip message_ids already stored as thread replies on another email
@@ -334,6 +422,9 @@ def sync_mailbox(
                     is_read = b"\\Seen" in flags
                     is_starred = b"\\Flagged" in flags
                     is_replied = b"\\Answered" in flags
+                    uid_i = int(uid)
+                    if existing.get("imap_uid") != uid_i:
+                        flag_updates["imap_uid"] = uid_i
                     if existing.get("read") != is_read:
                         flag_updates["read"] = is_read
                     if existing.get("starred") != is_starred:
@@ -496,6 +587,7 @@ def sync_mailbox(
 
                 parsed_batch.append({
                     "email_id": email_id,
+                    "imap_uid": int(uid),
                     "mid": mid,
                     "subject": subject,
                     "from_name": from_name,
@@ -595,6 +687,7 @@ def sync_mailbox(
                         "_id": email_data["email_id"],
                         "user_id": user_id,
                         "mailbox_id": mailbox_id,
+                        "imap_uid": email_data["imap_uid"],
                         "message_id": email_data["mid"],
                         "in_reply_to": email_data.get("in_reply_to", ""),
                         "thread_id": email_data["mid"],
@@ -722,7 +815,58 @@ def sync_mailbox(
                     traceback.print_exc()
 
         total_after = email_metadata_col().count_documents({"user_id": user_id, "mailbox_id": mailbox_id})
-        _finish_sync(mb["_id"], synced_count)
+        if _is_sync_cancelled(mb["_id"]):
+            # Do not mark "synced" or advance UID watermark on a partial cancelled run.
+            mailboxes_col().update_one(
+                {"_id": mb["_id"]},
+                {"$set": {"last_sync_at": datetime.now(timezone.utc), "sync_started_at": None, "sync_processed": total_fetched}},
+            )
+            return {
+                "synced": synced_count,
+                "thread_replies_added": thread_replies_added,
+                "skipped": skipped,
+                "flags_updated": flags_updated,
+                "total": total_after,
+                "total_fetched": total_fetched,
+                "skipped_reason": "cancelled",
+            }
+
+        if uid_mismatch:
+            next_scope = None
+        elif initial_sync == "last_n" and limit is not None and limit > 0:
+            next_scope = "new_since_uid"
+        elif initial_sync == "all":
+            next_scope = None
+        elif used_uid_incremental:
+            next_scope = mb.get("sync_uid_scope")
+        else:
+            next_scope = mb.get("sync_uid_scope")
+
+        if next_scope == "new_since_uid":
+            try:
+                flags_updated += _refresh_tracked_imap_flags(
+                    imap_client, user_id, mailbox_id, mb["_id"], uidvalidity
+                )
+            except Exception:
+                traceback.print_exc()
+
+        mailbox_sync_meta: dict = {}
+        if uidvalidity is not None:
+            mailbox_sync_meta["imap_uidvalidity"] = int(uidvalidity)
+        if uid_mismatch:
+            mailbox_sync_meta["sync_uid_scope"] = None
+            mailbox_sync_meta["imap_last_seen_max_uid"] = folder_max_uid
+        elif initial_sync == "last_n" and limit is not None and limit > 0:
+            mailbox_sync_meta["sync_uid_scope"] = "new_since_uid"
+            mailbox_sync_meta["imap_last_seen_max_uid"] = folder_max_uid
+        elif initial_sync == "all":
+            mailbox_sync_meta["sync_uid_scope"] = None
+            mailbox_sync_meta["imap_last_seen_max_uid"] = folder_max_uid
+        elif used_uid_incremental:
+            mailbox_sync_meta["imap_last_seen_max_uid"] = max(msg_ids)
+        else:
+            mailbox_sync_meta["imap_last_seen_max_uid"] = folder_max_uid
+        _finish_sync(mb["_id"], total_fetched, mailbox_sync_meta)
         return {"synced": synced_count, "thread_replies_added": thread_replies_added, "skipped": skipped, "flags_updated": flags_updated, "total": total_after, "total_fetched": total_fetched}
     except Exception as e:
         traceback.print_exc()
@@ -981,11 +1125,121 @@ def _is_sync_cancelled(mb_id) -> bool:
     return doc.get("sync_status") == "cancelled" if doc else True
 
 
-def _finish_sync(mb_id, count):
+def _refresh_tracked_imap_flags(
+    imap_client: IMAPClient,
+    user_id: str,
+    mailbox_id: str,
+    mb_id,
+    uidvalidity: int | None,
+) -> int:
+    """FLAGS-only IMAP fetch for rows with imap_uid (new_since_uid mailboxes). Rotates through all tracked UIDs over time."""
+    FLAG_BATCH = 80
+    SWEEP_LIMIT = 300
+
+    def _coerce_uidvalidity(uv) -> int | None:
+        if uv is None:
+            return None
+        try:
+            return int(uv)
+        except (TypeError, ValueError):
+            return None
+
+    folder_uv = _coerce_uidvalidity(uidvalidity)
+
+    mb_row = mailboxes_col().find_one({"_id": mb_id}, {"imap_flag_sweep_last_id": 1, "imap_uidvalidity": 1})
+    if not mb_row:
+        return 0
+    if folder_uv is not None and mb_row.get("imap_uidvalidity") is not None:
+        if int(mb_row["imap_uidvalidity"]) != folder_uv:
+            return 0
+
+    last_raw = mb_row.get("imap_flag_sweep_last_id")
+    base_q: dict = {
+        "user_id": user_id,
+        "mailbox_id": mailbox_id,
+        "imap_uid": {"$exists": True, "$ne": None},
+    }
+    proj = {"imap_uid": 1, "read": 1, "starred": 1, "replied_at": 1, "date": 1, "reply_count": 1}
+    docs: list = []
+    if last_raw:
+        docs = list(
+            email_metadata_col()
+            .find({**base_q, "_id": {"$gt": last_raw}}, proj)
+            .sort("_id", 1)
+            .limit(SWEEP_LIMIT)
+        )
+    if not docs:
+        docs = list(
+            email_metadata_col()
+            .find(base_q, proj)
+            .sort("_id", 1)
+            .limit(SWEEP_LIMIT)
+        )
+    if not docs:
+        return 0
+
+    uid_to_doc: dict[int, dict] = {}
+    for d in docs:
+        try:
+            u = int(d["imap_uid"])
+        except (TypeError, ValueError):
+            continue
+        uid_to_doc[u] = d
+    uids_sorted = sorted(uid_to_doc.keys())
+    if not uids_sorted:
+        return 0
+
+    updated = 0
+    for i in range(0, len(uids_sorted), FLAG_BATCH):
+        chunk = uids_sorted[i : i + FLAG_BATCH]
+        try:
+            fetched = imap_client.fetch(chunk, ["FLAGS"])
+        except Exception:
+            traceback.print_exc()
+            continue
+        for uid, data in fetched.items():
+            uid_i = int(uid)
+            doc = uid_to_doc.get(uid_i)
+            if not doc:
+                continue
+            flags = data.get(b"FLAGS", [])
+            is_read = b"\\Seen" in flags
+            is_starred = b"\\Flagged" in flags
+            is_replied = b"\\Answered" in flags
+            flag_updates: dict = {}
+            if doc.get("read") != is_read:
+                flag_updates["read"] = is_read
+            if doc.get("starred") != is_starred:
+                flag_updates["starred"] = is_starred
+            if is_replied and not doc.get("replied_at"):
+                ex_dt = doc.get("date")
+                flag_updates["replied_at"] = (
+                    ex_dt.isoformat()
+                    if isinstance(ex_dt, datetime)
+                    else datetime.now(timezone.utc).isoformat()
+                )
+                flag_updates["reply_count"] = int(doc.get("reply_count", 0) or 0) + 1
+            if flag_updates:
+                email_metadata_col().update_one({"_id": doc["_id"]}, {"$set": flag_updates})
+                updated += 1
+
     mailboxes_col().update_one(
         {"_id": mb_id},
-        {"$set": {"last_sync_at": datetime.now(timezone.utc), "sync_status": "synced", "sync_started_at": None}},
+        {"$set": {"imap_flag_sweep_last_id": str(docs[-1]["_id"])}},
     )
+    return updated
+
+
+def _finish_sync(mb_id, count, extra: dict | None = None):
+    fields = {
+        "last_sync_at": datetime.now(timezone.utc),
+        "sync_status": "synced",
+        "sync_started_at": None,
+        "sync_processed": count,
+    }
+    if extra:
+        fields.update(extra)
+    mailboxes_col().update_one({"_id": mb_id}, {"$set": fields})
 
 
 def _extract_body(msg) -> str:
@@ -1241,5 +1495,7 @@ def _serialize(doc: dict) -> dict:
         "username": doc["username"],
         "last_sync_at": doc.get("last_sync_at"),
         "sync_status": doc.get("sync_status", "pending"),
+        "sync_total_fetched": int(doc.get("sync_total_fetched", 0) or 0),
+        "sync_processed": int(doc.get("sync_processed", 0) or 0),
         "created_at": doc.get("created_at"),
     }

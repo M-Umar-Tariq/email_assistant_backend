@@ -106,6 +106,74 @@ def _is_broad_query(query: str) -> bool:
     return bool(_BROAD_KEYWORDS.search(query))
 
 
+# ── Query intent → LLM context budget ─────────────────────────────────────────
+#
+# These limits control how many emails the LLM *sees* — NOT how many an action
+# can affect.  The executor resolves bulk actions (mark_read with from_email,
+# trash with keywords, etc.) against the full database, so the LLM only needs
+# enough context to understand intent and identify filter criteria.
+
+_ACTION_RE = re.compile(
+    r"\b(mark\s+as\s+read|mark\s+read|mark\s+as\s+unread|mark\s+unread"
+    r"|delete|trash|archive|snooze|forward|reply\s+to|send\s+reply"
+    r"|open|read\s+the|read\s+email|read\s+this|show\s+me"
+    r"|mark\s+all|read\s+all|unread\s+all|delete\s+all|trash\s+all"
+    r"|archive\s+all|all\s+emails?\s+as\s+read|all\s+emails?\s+as\s+unread"
+    r"|all\s+emails?\s+from)\b",
+    re.I,
+)
+_COUNT_RE = re.compile(r"\b(how\s+many|count|total|number\s+of|kitni|kitne)\b", re.I)
+_SINGLE_EMAIL_RE = re.compile(
+    r"\b(this\s+email|that\s+email|the\s+email\s+from|one\s+email)\b", re.I
+)
+
+_FAST_ACTION_VERBS = re.compile(
+    r"\b(?:mark\b.*\b(?:read|unread)|trash|delete|archive|snooze|remove)\b",
+    re.I,
+)
+_NEEDS_CONTENT_RE = re.compile(
+    r"\b(?:summar|explain|what|why|who|show|read\s+(?:the|this|my|that)|open"
+    r"|reply|forward|send|compose|draft|write|search|find|list)\b",
+    re.I,
+)
+_REFERENCE_RE = re.compile(
+    r"\b(?:it|this|that|first|1st|latest|newest|most\s+recent|above|previous|last\s+one)\b",
+    re.I,
+)
+
+
+def _is_fast_action(query: str) -> bool:
+    """True for pure state-changing actions that don't need email bodies in the prompt."""
+    return (
+        bool(_FAST_ACTION_VERBS.search(query))
+        and not _NEEDS_CONTENT_RE.search(query)
+        and not _REFERENCE_RE.search(query)
+    )
+
+
+def _query_context_budget(query: str) -> dict:
+    """Decide how many emails the LLM needs in its context window.
+
+    The executor handles the real bulk work at DB level, so the LLM only
+    needs enough emails to: understand the user's request, identify the
+    sender / subject / keywords, and produce a good answer."""
+    q = query.strip()
+
+    if _SINGLE_EMAIL_RE.search(q) or _LATEST_EMAIL_PATTERN.search(q):
+        return {"limit": 5, "chunks": 40, "rerank": 25}
+
+    if _ACTION_RE.search(q):
+        return {"limit": 5, "chunks": 30, "rerank": 0}
+
+    if _COUNT_RE.search(q):
+        return {"limit": 50, "chunks": 150, "rerank": 80}
+
+    if _is_broad_query(q):
+        return {"limit": 40, "chunks": 150, "rerank": 80}
+
+    return {"limit": 20, "chunks": 120, "rerank": 70}
+
+
 # ── Context building ──────────────────────────────────────────────────────────
 
 def _format_date(meta: dict | None, content: dict, tz: ZoneInfo | None = None) -> str:
@@ -134,7 +202,10 @@ def _format_date(meta: dict | None, content: dict, tz: ZoneInfo | None = None) -
 
 def _build_email_block_full(content: dict, meta: dict | None, tz: ZoneInfo | None = None) -> str:
     """Rich context block for a single email — used when we have few emails."""
+    email_id = content.get("email_id", "")
     parts = [f"**Email: {content.get('subject', '(no subject)')}**"]
+    if email_id:
+        parts.append(f"ID: {email_id}")
     parts.append(f"From: {content.get('from_name', '')} <{content.get('from_email', '')}>")
 
     to_list = content.get("to", [])
@@ -174,6 +245,7 @@ def _build_email_block_full(content: dict, meta: dict | None, tz: ZoneInfo | Non
 
 def _build_email_block_compact(content: dict, meta: dict | None, tz: ZoneInfo | None = None) -> str:
     """Compact context block — used when we have many emails to fit more in context."""
+    email_id = content.get("email_id", "")
     tags = []
     if content.get("priority") == "high":
         tags.append("HIGH")
@@ -185,9 +257,10 @@ def _build_email_block_compact(content: dict, meta: dict | None, tz: ZoneInfo | 
         tags.append("UNREAD")
     tag_str = f" [{', '.join(tags)}]" if tags else ""
 
+    id_str = f" (ID: {email_id})" if email_id else ""
     preview = content.get("preview", "") or content.get("body_chunk", "")[:200]
     return (
-        f"• **{content.get('subject', '(no subject)')}**{tag_str}\n"
+        f"• **{content.get('subject', '(no subject)')}**{tag_str}{id_str}\n"
         f"  From: {content.get('from_name', '')} <{content.get('from_email', '')}> | "
         f"Date: {_format_date(meta, content, tz)}\n"
         f"  {preview[:300]}"
@@ -283,17 +356,24 @@ def _fetch_emails_by_vector(
         for r in search_results
     ]
 
-    rerank_top = len(documents) if rerank_cap is None else min(rerank_cap, len(documents))
-    reranked = rerank(query, documents, top_n=max(1, rerank_top))
-
     seen_ids: list[str] = []
     payload_map: dict[str, dict] = {}
-    for item in reranked:
-        point = search_results[item["index"]]
-        eid = point.payload.get("email_id", "")
-        if eid not in payload_map:
-            payload_map[eid] = point.payload
-            seen_ids.append(eid)
+
+    if rerank_cap is not None and rerank_cap <= 0:
+        for point in search_results:
+            eid = point.payload.get("email_id", "")
+            if eid and eid not in payload_map:
+                payload_map[eid] = point.payload
+                seen_ids.append(eid)
+    else:
+        rerank_top = len(documents) if rerank_cap is None else min(rerank_cap, len(documents))
+        reranked = rerank(query, documents, top_n=max(1, rerank_top))
+        for item in reranked:
+            point = search_results[item["index"]]
+            eid = point.payload.get("email_id", "")
+            if eid and eid not in payload_map:
+                payload_map[eid] = point.payload
+                seen_ids.append(eid)
 
     top_ids = seen_ids if limit is None else seen_ids[:limit]
     content_map = get_emails_content_batch(top_ids, user_id)
@@ -318,8 +398,12 @@ def _fetch_emails_by_vector(
                 "attachment_text": p.get("attachment_text", ""),
             }
         meta = email_metadata_col().find_one({"_id": eid, "user_id": user_id})
+        # Skip stale vector entries that no longer exist in MongoDB metadata.
+        # This prevents AI from generating actions for already-deleted emails.
+        if not meta:
+            continue
         contents.append(c)
-        metas.append(meta or {})
+        metas.append(meta)
 
     return contents, metas
 
@@ -334,41 +418,66 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
         except (KeyError, Exception):
             pass
 
-    time_label, start_dt, end_dt = _detect_time_range(query, tz)
-    broad = _is_broad_query(query)
-    want_latest = bool(_LATEST_EMAIL_PATTERN.search(query))
+    is_fast = _is_fast_action(query)
+    time_label = ""
 
-    if time_label or broad or want_latest:
-        contents, metas = _fetch_emails_by_date(user_id, start_dt, end_dt, mailbox_id, limit=0)
-
-        if not contents and not broad and not want_latest:
-            contents, metas = _fetch_emails_by_vector(user_id, query, mailbox_id)
+    if is_fast:
+        contents, metas = [], []
+        sources = []
     else:
-        contents, metas = _fetch_emails_by_vector(user_id, query, mailbox_id)
+        time_label, start_dt, end_dt = _detect_time_range(query, tz)
+        broad = _is_broad_query(query)
+        want_latest = bool(_LATEST_EMAIL_PATTERN.search(query))
+        budget = _query_context_budget(query)
 
-    if not contents:
-        return {
-            "answer": "I couldn't find any relevant emails matching your query.",
-            "sources": [],
-            "actions": [],
-        }
+        if time_label or broad or want_latest:
+            contents, metas = _fetch_emails_by_date(
+                user_id, start_dt, end_dt, mailbox_id,
+                limit=budget["limit"],
+            )
 
-    FULL_CUTOFF = 35
-    use_compact = len(contents) > FULL_CUTOFF
-    context_blocks = []
-    sources = []
-    for i, (c, m) in enumerate(zip(contents, metas)):
-        if use_compact and i >= FULL_CUTOFF:
-            context_blocks.append(_build_email_block_compact(c, m, tz))
+            if not contents and not broad and not want_latest:
+                contents, metas = _fetch_emails_by_vector(
+                    user_id, query, mailbox_id,
+                    limit=budget["limit"],
+                    search_chunk_limit=budget["chunks"],
+                    rerank_cap=budget["rerank"],
+                )
         else:
-            context_blocks.append(_build_email_block_full(c, m, tz))
-        sources.append({
-            "email_id": c.get("email_id", ""),
-            "subject": c.get("subject", ""),
-        })
+            contents, metas = _fetch_emails_by_vector(
+                user_id, query, mailbox_id,
+                limit=budget["limit"],
+                search_chunk_limit=budget["chunks"],
+                rerank_cap=budget["rerank"],
+            )
 
-    separator = "\n\n" if use_compact else "\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    context = separator.join(context_blocks)
+        if not contents:
+            return {
+                "answer": "I couldn't find any relevant emails matching your query.",
+                "sources": [],
+                "actions": [],
+            }
+
+    if contents:
+        FULL_CUTOFF = 35
+        use_compact = len(contents) > FULL_CUTOFF
+        context_blocks = []
+        sources = []
+        for i, (c, m) in enumerate(zip(contents, metas)):
+            if use_compact and i >= FULL_CUTOFF:
+                context_blocks.append(_build_email_block_compact(c, m, tz))
+            else:
+                context_blocks.append(_build_email_block_full(c, m, tz))
+            sources.append({
+                "email_id": c.get("email_id", ""),
+                "subject": c.get("subject", ""),
+            })
+        separator = "\n\n" if use_compact else "\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        context = separator.join(context_blocks)
+    else:
+        use_compact = False
+        context = "(No email content loaded — use filter params: from_email, subject, or keywords to target emails.)"
+
     now = datetime.now(timezone.utc)
     if tz:
         now_local = now.astimezone(tz)
@@ -377,20 +486,21 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
         now_str = now.strftime("%A, %B %d, %Y %H:%M UTC")
 
     range_note = ""
-    range_note += (
-        "\nIMPORTANT: The emails below are always ordered by date, newest first. "
-        "The FIRST email in the list is the user's latest (most recent) email. "
-        "When the user asks for 'latest', 'newest', 'most recent', or 'last email', "
-        "you must use the first email in the list.\n"
-    )
-    if time_label:
-        range_note += f"\nNote: The user asked about '{time_label.replace('_', ' ')}'. All {len(contents)} emails in that range are provided below.\n"
-    if use_compact:
+    if not is_fast:
         range_note += (
-            f"\nThe first {min(FULL_CUTOFF, len(contents))} emails below have FULL content; "
-            "use them to answer questions like 'what does this email say' or 'what is he asking'. "
-            "The rest are short previews.\n"
+            "\nIMPORTANT: The emails below are always ordered by date, newest first. "
+            "The FIRST email in the list is the user's latest (most recent) email. "
+            "When the user asks for 'latest', 'newest', 'most recent', or 'last email', "
+            "you must use the first email in the list.\n"
         )
+        if time_label:
+            range_note += f"\nNote: The user asked about '{time_label.replace('_', ' ')}'. All {len(contents)} emails in that range are provided below.\n"
+        if use_compact:
+            range_note += (
+                f"\nThe first {min(FULL_CUTOFF, len(contents))} emails below have FULL content; "
+                "use them to answer questions like 'what does this email say' or 'what is he asking'. "
+                "The rest are short previews.\n"
+            )
 
     mbox_docs = list(mailboxes_col().find({"user_id": user_id}))
     mailbox_info = [
@@ -433,53 +543,56 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
         "- If an email has attachments, mention the attachment names.\n"
         "- If you cannot find enough information, say so honestly rather than guessing.\n"
         "- Be thorough: include relevant details from the emails. Respond in the same language the user is asking in.\n\n"
-        "CAPABILITIES — you can take real actions. When the user asks you to send, reply, "
-        "forward, delete, archive, or mark emails, include a JSON block using this format:\n\n"
+        "CAPABILITIES — you can take REAL actions on emails. When the user asks you to "
+        "perform any action (mark read, send, reply, forward, delete, archive, etc.), "
+        "you MUST include a JSON action block. Each email in the context has an ID field — "
+        "use that exact ID when targeting a specific email.\n\n"
+        "Action block format:\n"
         "```actions\n"
-        '[{"type":"send_email","to":"x@y.com","subject":"...","body":"...",'
-        '"mailbox_id":"...","label":"short desc","description":"details",'
-        '"requires_approval":true}]\n'
+        '[{"type":"<action_type>","email_id":"<from context>","label":"short desc",'
+        '"description":"details","requires_approval":true}]\n'
         "```\n\n"
-        "Action types:\n"
-        "- send_email: to (email or array), subject, body, mailbox_id (optional). "
-        "Example: {\"type\":\"send_email\",\"to\":\"ahmed@example.com\",\"subject\":\"...\",\"body\":\"...\",\"label\":\"...\",\"requires_approval\":true}\n"
-        "- forward_email: email_id, to (email or array), mailbox_id (optional), body (optional prefix). "
-        "Example: {\"type\":\"forward_email\",\"email_id\":\"...\",\"to\":\"someone@example.com\",\"label\":\"...\",\"requires_approval\":true}\n"
-        "- trash_email: email_id (move to trash/delete). "
-        "Example: {\"type\":\"trash_email\",\"email_id\":\"...\",\"label\":\"Move to trash\",\"requires_approval\":true}\n"
-        "- archive_email: email_id. "
-        "Example: {\"type\":\"archive_email\",\"email_id\":\"...\",\"label\":\"Archive email\",\"requires_approval\":true}\n"
-        "- mark_read: email_id (mark as read). "
-        "Example: {\"type\":\"mark_read\",\"email_id\":\"...\",\"label\":\"Mark as read\",\"requires_approval\":false}\n"
-        "- draft_reply (email_id,instructions) | send_reply (email_id,body or instructions,mailbox_id) | "
-        "send_whatsapp (to=phone,body) | set_reminder (hours,note)\n\n"
+        "ALL ACTION TYPES (use the exact type string):\n\n"
+        "TARGETING: Every action that operates on emails accepts these filter params:\n"
+        "  - email_id: target ONE specific email (use the ID from context).\n"
+        "  - from_email: target ALL emails from this sender address.\n"
+        "  - subject: target ALL emails whose subject matches (substring).\n"
+        "  - keywords: target ALL emails matching keywords in subject or preview.\n"
+        "  For a single email, use email_id. For bulk (e.g. 'all emails from X'), use from_email/subject/keywords. "
+        "Do NOT list many individual email_ids — use a filter instead.\n\n"
+        "- read_emails: fetch inbox emails. Extra params: unread_only, limit, folder.\n"
+        "- open_email: open a specific email. Needs email_id.\n"
+        "- open_latest_email: open the most recent email.\n"
+        "- search_emails: search by query. Extra params: query (REQUIRED), limit.\n"
+        "- send_email: send a new email. Params: to (REQUIRED), subject, body, cc, mailbox_id.\n"
+        "- draft_email: prepare a draft (not sent). Params: to, subject, body, mailbox_id.\n"
+        "- draft_reply: AI-generate a reply draft. Needs email_id + instructions.\n"
+        "- send_reply: send a reply. Needs email_id + body or instructions, mailbox_id.\n"
+        "- reply_all: reply to all. Needs email_id + body (REQUIRED), mailbox_id.\n"
+        "- forward_email: forward. Needs email_id + to (REQUIRED), body (optional), mailbox_id.\n"
+        "- trash_email: move to trash. Accepts email_id OR from_email/subject/keywords for bulk.\n"
+        "- delete_email: permanently delete. Accepts email_id OR filters for bulk.\n"
+        "- archive_email: archive. Accepts email_id OR filters for bulk.\n"
+        "- mark_read: mark as read. Accepts email_id OR from_email/subject/keywords for bulk.\n"
+        "- mark_unread: mark as unread. Accepts email_id OR filters for bulk.\n"
+        "- mark_all_read: mark ALL inbox emails as read. NO email_id needed. Optional: mailbox_id.\n"
+        "- mark_all_unread: mark ALL inbox emails as unread. NO email_id needed. Optional: mailbox_id.\n"
+        "- snooze_email: snooze. Accepts email_id OR filters for bulk + hours (default 24).\n"
+        "- send_whatsapp: send WhatsApp. Params: to (phone REQUIRED), body (REQUIRED).\n"
+        "- set_reminder: set reminder. Params: email_id, hours (default 24).\n\n"
         "ACTION RULES:\n"
-        "1. Always requires_approval=true for sending emails/messages and for delete/trash/archive\n"
-        "2. Be proactive — when the user asks to send, reply, forward, or take action, DO IT by emitting the action block\n"
-        "3. Reference specific emails by subject/sender and include a brief content summary\n"
-        "4. Respond in the same language the user speaks\n"
-        "5. Use send_reply when the user wants to reply to an existing email. Use send_email for NEW emails.\n"
-        "6. Use forward_email when the user wants to forward an existing email.\n"
-        "7. When the user says 'delete', 'remove', 'trash' an email, use trash_email. "
-        "When they say 'archive', use archive_email. When they say 'mark as read', use mark_read.\n"
-        "8. RECIPIENT RESOLUTION: When the user says a name (e.g. 'send email to Ahmed'), "
-        "look up their email from KEY CONTACTS. **If multiple contacts share the same or "
-        "similar name, you MUST list ALL matching contacts with their email addresses and "
-        "ask the user to pick the correct one. NEVER auto-pick one silently.**\n"
-        "9. SENDER CONFIRMATION: Before emitting any send_email, send_reply, or forward_email "
-        "action, you MUST clearly state:\n"
-        "   - **From**: which mailbox/email address the email will be sent from\n"
-        "   - **To**: the recipient's full email address\n"
-        "   - **Subject** and a brief summary of the body\n"
-        "   If the user has multiple mailboxes, ask which one to send from. "
-        "Only emit the action block AFTER the user confirms these details or says 'send it'.\n\n"
-        "- SCOPE: You are strictly an EMAIL assistant. If the user asks about "
-        "anything unrelated to their emails, inbox, contacts, or email-related "
-        "tasks (e.g. general knowledge, coding, math, recipes, weather, etc.), "
-        "respond warmly and empathetically but gently redirect. Example: "
-        "\"That's a great question! But I'm your email assistant — I'm best at "
-        "helping you with your inbox, emails, and contacts. Is there anything "
-        "email-related I can help with?\"\n\n"
+        "1. ALWAYS set requires_approval=true — the user must confirm before execution.\n"
+        "2. Be proactive — when the user asks to do something, emit the action block immediately.\n"
+        "3. For a single email use its ID from context. For bulk by sender use from_email. Never list many IDs.\n"
+        "4. Respond in the same language the user speaks.\n"
+        "5. Use send_reply for replies, reply_all for reply-all, send_email for NEW messages.\n"
+        "6. Use trash_email for delete/remove/trash. Use archive_email for archive.\n"
+        "7. For ALL inbox read/unread with no sender filter use mark_all_read / mark_all_unread.\n"
+        "8. RECIPIENT RESOLUTION: When the user says a name, look up email from KEY CONTACTS. "
+        "If multiple match, list ALL and ask the user to pick.\n"
+        "9. SENDER CONFIRMATION: Before send_email/send_reply/forward_email, state From, To, Subject. "
+        "If multiple mailboxes, ask which one.\n\n"
+        "SCOPE: You are strictly an EMAIL assistant. Gently redirect off-topic questions.\n\n"
         f"EMAIL CONTEXT ({len(contents)} emails):\n\n{context}"
     )
 
@@ -494,7 +607,7 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
 
     messages.append({"role": "user", "content": query})
 
-    response_text = chat_multi(messages, temperature=0.4, max_tokens=8192)
+    response_text = chat_multi(messages, temperature=0.4, max_tokens=2048 if is_fast else 8192)
 
     actions = _extract_actions(response_text)
     clean_text = _clean_response(response_text)
@@ -646,11 +759,8 @@ def _extract_actions(text: str) -> list[dict]:
                 ts = int(datetime.now(timezone.utc).timestamp())
                 for i, a in enumerate(parsed):
                     a["id"] = f"act-{i}-{ts}"
-                    a["status"] = (
-                        "awaiting_approval"
-                        if a.get("requires_approval", True)
-                        else "pending"
-                    )
+                    a["requires_approval"] = True
+                    a["status"] = "awaiting_approval"
                     a["timestamp"] = datetime.now(timezone.utc).isoformat()
                     actions.append(a)
         except (json.JSONDecodeError, TypeError):

@@ -156,15 +156,23 @@ def agent_chat(
         f"KEY CONTACTS:\n{json.dumps(contacts_lookup, default=str)}\n\n"
         f"RELEVANT EMAILS:\n{email_context or 'None found.'}\n\n"
         "ACTIONS — when needed, append a JSON block (the user won't see it, only the "
-        "spoken text before it). Format:\n"
+        "spoken text before it). Each email in the context has an ID.\n"
         "```actions\n"
-        '[{"type":"send_email","to":"x@y.com","subject":"...","body":"...",'
-        '"mailbox_id":"...","label":"short desc","description":"details",'
+        '[{"type":"mark_read","from_email":"x@y.com","label":"Mark all from X as read",'
         '"requires_approval":true}]\n'
         "```\n"
-        "Types: send_email, forward_email (needs email_id), trash_email, archive_email, "
-        "mark_read, draft_reply, send_reply, send_whatsapp, set_reminder.\n"
-        "Always set requires_approval=true for send/delete/trash/archive/forward.\n\n"
+        "TARGETING: For one email use email_id. For bulk by sender use from_email. "
+        "You can also use subject or keywords to match multiple emails. "
+        "Never list many individual email_ids — use a filter.\n\n"
+        "Types: read_emails, open_email, open_latest_email, search_emails, "
+        "send_email, draft_email, draft_reply, send_reply, reply_all, forward_email, "
+        "trash_email, move_to_trash, archive_email, delete_email, "
+        "mark_read, mark_unread (accept email_id OR from_email/subject/keywords for bulk), "
+        "mark_all_read (ALL inbox → read, no email_id), "
+        "mark_all_unread (ALL inbox → unread, no email_id), "
+        "snooze_email (email_id or filters + hours), "
+        "send_whatsapp (to, body), set_reminder (email_id, hours).\n"
+        "Always set requires_approval=true for EVERY action.\n\n"
         "RULES:\n"
         "1. VOICE FIRST: Every response must sound natural when spoken. No visual formatting.\n"
         "2. BREVITY: 1-3 sentences for simple queries. Up to 5 for email summaries.\n"
@@ -173,8 +181,12 @@ def agent_chat(
         "5. Before sending, confirm: from which mailbox, to whom, about what. Keep it spoken.\n"
         "6. Respond in the same language the user speaks.\n"
         "7. SCOPE: email assistant only. Gently redirect off-topic questions.\n"
-        "8. Use send_reply for replies, send_email for new messages, forward_email for forwards.\n"
-        "9. For delete/trash/archive/mark-read, use the matching action type with email_id."
+        "8. Use send_reply for replies, reply_all for reply-all, send_email for new messages.\n"
+        "9. For delete/trash/archive/mark-unread/snooze, use the matching action type.\n"
+        "10. BULK READ vs UNREAD — do not confuse them:\n"
+        "    - User wants READ / clear unread / mark everything read → type mark_all_read.\n"
+        "    - User wants UNREAD / mark all as unread / make everything unread → type mark_all_unread.\n"
+        "11. For 'all from sender X', use from_email filter. For 'all inbox', use mark_all_read/mark_all_unread."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -387,11 +399,8 @@ def _extract_actions(text: str) -> list[dict]:
                 ts = int(datetime.now(timezone.utc).timestamp())
                 for i, a in enumerate(parsed):
                     a["id"] = f"act-{i}-{ts}"
-                    a["status"] = (
-                        "awaiting_approval"
-                        if a.get("requires_approval", True)
-                        else "pending"
-                    )
+                    a["requires_approval"] = True
+                    a["status"] = "awaiting_approval"
                     a["timestamp"] = datetime.now(timezone.utc).isoformat()
                     actions.append(a)
         except (json.JSONDecodeError, TypeError):
