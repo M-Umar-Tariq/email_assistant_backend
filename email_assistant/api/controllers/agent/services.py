@@ -16,9 +16,19 @@ from api.controllers.ai.services import (
     _build_email_block_full,
 )
 from api.utils.llm import chat_multi, chat_json
-from api.utils.qdrant_helpers import get_email_content
+from api.utils.qdrant_helpers import (
+    get_email_content,
+    get_email_ids_by_sender,
+    get_emails_content_batch,
+)
 from .profile import get_profile
 from .executor import execute_action
+
+
+# Matches bare email addresses in free-form user text.
+_EMAIL_RE = re.compile(
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+)
 
 
 # ── Email limit classifier ────────────────────────────────────────────────────
@@ -78,6 +88,66 @@ def _agent_needs_email_rag(message: str) -> bool:
 
 # ── Agent chat ────────────────────────────────────────────────────────────────
 
+def _extract_sender_emails(message: str) -> list[str]:
+    """Extract unique email addresses from the user's message (lowercased)."""
+    if not message:
+        return []
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw in _EMAIL_RE.findall(message):
+        addr = raw.strip().lower()
+        if addr and addr not in seen:
+            seen.add(addr)
+            ordered.append(addr)
+    return ordered
+
+
+def _fetch_emails_by_sender_addrs(
+    user_id: str,
+    addrs: list[str],
+    mailbox_id: str | None,
+    per_sender_limit: int = 15,
+) -> tuple[list[dict], list[dict]]:
+    """Deterministic sender-based retrieval.
+
+    Vector search does not reliably match exact email addresses, so when the
+    user's message mentions a sender like "delete all emails from x@y.com" we
+    still need to surface those emails to the LLM so it emits the correct
+    action instead of claiming none were found.
+    """
+    if not addrs:
+        return [], []
+
+    all_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for addr in addrs:
+        ids = get_email_ids_by_sender(user_id, addr, mailbox_id)
+        for eid in ids[:per_sender_limit]:
+            if eid and eid not in seen_ids:
+                seen_ids.add(eid)
+                all_ids.append(eid)
+    if not all_ids:
+        return [], []
+
+    content_map = get_emails_content_batch(all_ids, user_id)
+    metas_by_id = {
+        str(m["_id"]): m
+        for m in email_metadata_col().find(
+            {"_id": {"$in": all_ids}, "user_id": user_id, "archived": False, "trashed": False}
+        )
+    }
+
+    contents: list[dict] = []
+    metas: list[dict] = []
+    for eid in all_ids:
+        c = content_map.get(eid)
+        m = metas_by_id.get(eid)
+        if c and m:
+            contents.append(c)
+            metas.append(m)
+    return contents, metas
+
+
 def agent_chat(
     user_id: str,
     message: str,
@@ -85,6 +155,11 @@ def agent_chat(
     mailbox_id: str | None = None,
 ) -> dict:
     profile = get_profile(user_id)
+
+    sender_addrs = _extract_sender_emails(message)
+    sender_contents, sender_metas = _fetch_emails_by_sender_addrs(
+        user_id, sender_addrs, mailbox_id
+    )
 
     if _agent_needs_email_rag(message):
         email_limit = _classify_email_limit(message)
@@ -98,6 +173,19 @@ def agent_chat(
         )
     else:
         contents, metas = [], []
+
+    if sender_contents:
+        seen_ids = {c.get("email_id") for c in sender_contents if c.get("email_id")}
+        merged_contents = list(sender_contents)
+        merged_metas = list(sender_metas)
+        for c, m in zip(contents, metas):
+            eid = c.get("email_id")
+            if not eid or eid not in seen_ids:
+                merged_contents.append(c)
+                merged_metas.append(m)
+                if eid:
+                    seen_ids.add(eid)
+        contents, metas = merged_contents, merged_metas
 
     mbox_docs = list(mailboxes_col().find({"user_id": user_id}))
     mailbox_info = [
@@ -162,12 +250,20 @@ def agent_chat(
         '"requires_approval":true}]\n'
         "```\n"
         "TARGETING: For one email use email_id. For bulk by sender use from_email. "
-        "You can also use subject or keywords to match multiple emails. "
+        "You can also use subject, keywords, folder, mailbox_id, label_name, read, date_from/date_to "
+        "to match multiple emails. "
         "Never list many individual email_ids — use a filter.\n\n"
+        "SENDER LOOKUPS: When the user references an email address (e.g. "
+        "'delete all emails from x@y.com'), the backend will exactly match "
+        "that address against the inbox. ALWAYS emit the action with "
+        "from_email set to the mentioned address — even if RELEVANT EMAILS "
+        "above doesn't obviously show a match. Do NOT reply 'I couldn't find "
+        "any emails from that sender' just because the shown context is short; "
+        "the executor searches the full mailbox, not just the shown context.\n\n"
         "Types: read_emails, open_email, open_latest_email, search_emails, "
         "send_email, draft_email, draft_reply, send_reply, reply_all, forward_email, "
         "trash_email, move_to_trash, archive_email, delete_email, "
-        "mark_read, mark_unread (accept email_id OR from_email/subject/keywords for bulk), "
+        "mark_read, mark_unread (accept email_id OR filters for bulk), "
         "mark_all_read (ALL inbox → read, no email_id), "
         "mark_all_unread (ALL inbox → unread, no email_id), "
         "snooze_email (email_id or filters + hours), "
@@ -182,7 +278,8 @@ def agent_chat(
         "6. Respond in the same language the user speaks.\n"
         "7. SCOPE: email assistant only. Gently redirect off-topic questions.\n"
         "8. Use send_reply for replies, reply_all for reply-all, send_email for new messages.\n"
-        "9. For delete/trash/archive/mark-unread/snooze, use the matching action type.\n"
+        "9. For delete/trash/archive/mark-unread/snooze, use the matching action type. "
+        "delete_email and trash_email both mean move to trash, not permanent delete.\n"
         "10. BULK READ vs UNREAD — do not confuse them:\n"
         "    - User wants READ / clear unread / mark everything read → type mark_all_read.\n"
         "    - User wants UNREAD / mark all as unread / make everything unread → type mark_all_unread.\n"

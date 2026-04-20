@@ -7,7 +7,7 @@ from email.utils import make_msgid
 
 from bson import ObjectId
 from django.conf import settings
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
 
 from database.db import (
     email_metadata_col,
@@ -470,6 +470,21 @@ def trash_email(user_id: str, email_id: str) -> bool:
     return r.modified_count > 0
 
 
+def move_email_to_inbox(user_id: str, email_id: str) -> bool:
+    meta = email_metadata_col().find_one({"_id": email_id, "user_id": user_id})
+    if not meta:
+        return False
+    r = email_metadata_col().update_one(
+        {"_id": email_id, "user_id": user_id},
+        {"$set": {"trashed": False, "archived": False, "spam": False}},
+    )
+    if r.modified_count > 0:
+        mailbox_services.move_to_inbox_on_imap(
+            user_id, meta["mailbox_id"], meta["message_id"]
+        )
+    return r.modified_count > 0
+
+
 def spam_email(user_id: str, email_id: str) -> bool:
     meta = email_metadata_col().find_one({"_id": email_id, "user_id": user_id})
     if not meta:
@@ -514,6 +529,301 @@ def delete_email(user_id: str, email_id: str) -> bool:
     return True
 
 
+# ── Bulk actions (one request → one DB call + one IMAP session per mailbox) ──
+#
+# These replace the old pattern of issuing N individual HTTP requests from
+# the frontend (each doing its own Mongo lookup + IMAP login/select/search).
+# A bulk archive of 50 emails now becomes:
+#   * 1 metadata batch find_one  →  `find({_id: {$in: [...]}})`
+#   * 1 Mongo `update_many`
+#   * 1 IMAP session per mailbox (usually 1), with 1 `move`
+# Instead of 50 × (login + select + search + move) round-trips.
+
+
+def _group_metas_by_mailbox(metas: list[dict]) -> dict[str, list[str]]:
+    """From a list of email metadata docs, return {mailbox_id: [message_id...]}."""
+    by_mailbox: dict[str, list[str]] = {}
+    for m in metas:
+        mb_id = str(m.get("mailbox_id") or "")
+        mid = m.get("message_id")
+        if not mb_id or not mid:
+            continue
+        by_mailbox.setdefault(mb_id, []).append(mid)
+        for tmid in m.get("thread_message_ids", []) or []:
+            if tmid:
+                by_mailbox[mb_id].append(tmid)
+    return by_mailbox
+
+
+def _fetch_metas_for_bulk(user_id: str, email_ids: list[str]) -> tuple[list[dict], list[str]]:
+    """Returns (matching_metas, failed_ids) for a bulk operation."""
+    if not email_ids:
+        return [], []
+    metas = list(email_metadata_col().find(
+        {"_id": {"$in": email_ids}, "user_id": user_id}
+    ))
+    found = {m["_id"] for m in metas}
+    failed = [eid for eid in email_ids if eid not in found]
+    return metas, failed
+
+
+def bulk_update_emails(user_id: str, email_ids: list[str], data: dict) -> dict:
+    """Bulk patch `read` and/or `starred` across many emails.
+
+    `data` accepts the same keys as `update_email` (`read`, `starred`).
+    """
+    metas, failed = _fetch_metas_for_bulk(user_id, email_ids)
+    if not metas:
+        return {"processed": 0, "failed": failed}
+
+    update_fields: dict = {}
+    if "read" in data:
+        update_fields["read"] = bool(data["read"])
+    if "starred" in data:
+        update_fields["starred"] = bool(data["starred"])
+    if not update_fields:
+        return {"processed": 0, "failed": email_ids}
+
+    ids = [m["_id"] for m in metas]
+    email_metadata_col().update_many(
+        {"_id": {"$in": ids}, "user_id": user_id},
+        {"$set": update_fields},
+    )
+
+    by_mailbox = _group_metas_by_mailbox(metas)
+    for mb_id, mids in by_mailbox.items():
+        if "read" in update_fields:
+            mailbox_services.bulk_set_flag_on_imap(
+                user_id, mb_id, mids, b"\\Seen", update_fields["read"]
+            )
+        if "starred" in update_fields:
+            mailbox_services.bulk_set_flag_on_imap(
+                user_id, mb_id, mids, b"\\Flagged", update_fields["starred"]
+            )
+    return {"processed": len(ids), "failed": failed}
+
+
+def bulk_archive_emails(user_id: str, email_ids: list[str]) -> dict:
+    metas, failed = _fetch_metas_for_bulk(user_id, email_ids)
+    if not metas:
+        return {"processed": 0, "failed": failed}
+    ids = [m["_id"] for m in metas]
+    email_metadata_col().update_many(
+        {"_id": {"$in": ids}, "user_id": user_id},
+        {"$set": {"archived": True}},
+    )
+    by_mailbox = _group_metas_by_mailbox(metas)
+    for mb_id, mids in by_mailbox.items():
+        mailbox_services.bulk_archive_on_imap(user_id, mb_id, mids)
+    return {"processed": len(ids), "failed": failed}
+
+
+def bulk_trash_emails(user_id: str, email_ids: list[str]) -> dict:
+    metas, failed = _fetch_metas_for_bulk(user_id, email_ids)
+    if not metas:
+        return {"processed": 0, "failed": failed}
+    ids = [m["_id"] for m in metas]
+    email_metadata_col().update_many(
+        {"_id": {"$in": ids}, "user_id": user_id},
+        {"$set": {"trashed": True}},
+    )
+    by_mailbox = _group_metas_by_mailbox(metas)
+    for mb_id, mids in by_mailbox.items():
+        mailbox_services.bulk_trash_on_imap(user_id, mb_id, mids)
+    return {"processed": len(ids), "failed": failed}
+
+
+def bulk_spam_emails(user_id: str, email_ids: list[str]) -> dict:
+    metas, failed = _fetch_metas_for_bulk(user_id, email_ids)
+    if not metas:
+        return {"processed": 0, "failed": failed}
+    ids = [m["_id"] for m in metas]
+    email_metadata_col().update_many(
+        {"_id": {"$in": ids}, "user_id": user_id},
+        {"$set": {"trashed": True, "spam": True}},
+    )
+    by_mailbox = _group_metas_by_mailbox(metas)
+    for mb_id, mids in by_mailbox.items():
+        mailbox_services.bulk_spam_on_imap(user_id, mb_id, mids)
+    return {"processed": len(ids), "failed": failed}
+
+
+def bulk_move_to_inbox_emails(user_id: str, email_ids: list[str]) -> dict:
+    metas, failed = _fetch_metas_for_bulk(user_id, email_ids)
+    if not metas:
+        return {"processed": 0, "failed": failed}
+    ids = [m["_id"] for m in metas]
+    email_metadata_col().update_many(
+        {"_id": {"$in": ids}, "user_id": user_id},
+        {"$set": {"trashed": False, "archived": False, "spam": False}},
+    )
+    by_mailbox = _group_metas_by_mailbox(metas)
+    for mb_id, mids in by_mailbox.items():
+        mailbox_services.bulk_move_to_inbox_on_imap(user_id, mb_id, mids)
+    return {"processed": len(ids), "failed": failed}
+
+
+def bulk_snooze_emails(user_id: str, email_ids: list[str], hours: int) -> dict:
+    """Snooze many emails until `now + hours` in a single Mongo call."""
+    if not email_ids:
+        return {"processed": 0, "failed": []}
+    until = datetime.now(timezone.utc) + timedelta(hours=hours)
+    res = email_metadata_col().update_many(
+        {"_id": {"$in": email_ids}, "user_id": user_id},
+        {"$set": {"snoozed_until": until}},
+    )
+    matched = res.matched_count
+    failed = [] if matched == len(email_ids) else [
+        eid for eid in email_ids
+        if not email_metadata_col().find_one(
+            {"_id": eid, "user_id": user_id}, {"_id": 1}
+        )
+    ]
+    return {"processed": matched, "failed": failed}
+
+
+def bulk_delete_emails(user_id: str, email_ids: list[str]) -> dict:
+    """Permanently delete many emails + related records (single IMAP session
+    per mailbox, batched Mongo + Qdrant deletes)."""
+    metas, failed = _fetch_metas_for_bulk(user_id, email_ids)
+    if not metas:
+        return {"processed": 0, "failed": failed}
+
+    by_mailbox = _group_metas_by_mailbox(metas)
+    for mb_id, mids in by_mailbox.items():
+        mailbox_services.bulk_trash_on_imap(user_id, mb_id, mids)
+
+    ids = [m["_id"] for m in metas]
+    email_metadata_col().delete_many({"_id": {"$in": ids}, "user_id": user_id})
+    email_attachments_col().delete_many({"email_id": {"$in": ids}, "user_id": user_id})
+    follow_ups_col().delete_many({"email_id": {"$in": ids}, "user_id": user_id})
+    meetings_col().delete_many({"email_id": {"$in": ids}, "user_id": user_id})
+
+    try:
+        get_qdrant().delete(
+            collection_name=settings.QDRANT_COLLECTION_EMAIL_CHUNKS,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    FieldCondition(key="email_id", match=MatchAny(any=ids)),
+                ]
+            ),
+        )
+    except Exception:
+        pass
+
+    return {"processed": len(ids), "failed": failed}
+
+
+# ── Detected meetings (user must approve each one) ───────────────────────────
+
+def list_emails_with_meetings(
+    user_id: str,
+    mailbox_id: str | None = None,
+    status_filter: str | None = None,
+) -> dict:
+    """Return received emails that have a detected meeting.
+
+    `status_filter`: None (all), "pending", "added", or "dismissed".
+    Result includes per-status counts so the UI can show a pending badge.
+    """
+    col = email_metadata_col()
+    base: dict = {
+        "user_id": user_id,
+        "archived": False,
+        "trashed": False,
+        "$or": [{"is_sent": {"$ne": True}}, {"is_sent": {"$exists": False}}],
+        "detected_meeting": {"$exists": True, "$ne": None},
+    }
+    if mailbox_id:
+        base["mailbox_id"] = mailbox_id
+
+    pending_count = col.count_documents({**base, "meeting_status": "pending"})
+    added_count = col.count_documents({**base, "meeting_status": "added"})
+    dismissed_count = col.count_documents({**base, "meeting_status": "dismissed"})
+    total_count = col.count_documents(base)
+
+    q = dict(base)
+    sf = (status_filter or "").strip().lower()
+    if sf in ("pending", "added", "dismissed"):
+        q["meeting_status"] = sf
+
+    docs = list(col.find(q).sort("date", -1).limit(200))
+    if not docs:
+        return {
+            "emails": [],
+            "total": total_count,
+            "pending": pending_count,
+            "added": added_count,
+            "dismissed": dismissed_count,
+        }
+
+    email_ids = [str(d["_id"]) for d in docs]
+    content_map = get_emails_content_batch(email_ids, user_id)
+    rows = [_merge_email(d, content_map.get(str(d["_id"]), {})) for d in docs]
+    return {
+        "emails": rows,
+        "total": total_count,
+        "pending": pending_count,
+        "added": added_count,
+        "dismissed": dismissed_count,
+    }
+
+
+def add_detected_meeting_to_calendar(user_id: str, email_id: str) -> dict | None:
+    """Promote an email's detected meeting to a real calendar event.
+
+    Returns {"meeting": {...}, "email": {...}} on success, or None if the
+    email is missing or has no detection to promote.
+    """
+    from api.controllers.calendar.services import upsert_meeting_from_email
+
+    meta = email_metadata_col().find_one({"_id": email_id, "user_id": user_id})
+    if not meta:
+        return None
+    dm = meta.get("detected_meeting")
+    if not dm or not isinstance(dm, dict):
+        return None
+
+    payload = {
+        "title": dm.get("title") or meta.get("subject") or "Meeting",
+        "start": dm.get("start"),
+        "end": dm.get("end"),
+        "location": dm.get("location"),
+        "attendees": dm.get("attendees") or [],
+    }
+    meeting = upsert_meeting_from_email(
+        user_id,
+        email_id,
+        payload,
+        mailbox_id=meta.get("mailbox_id"),
+    )
+    if not meeting:
+        return None
+
+    email_metadata_col().update_one(
+        {"_id": email_id, "user_id": user_id},
+        {"$set": {"meeting_status": "added", "meeting_id": meeting.get("id")}},
+    )
+    refreshed = get_email(user_id, email_id)
+    return {"meeting": meeting, "email": refreshed}
+
+
+def dismiss_detected_meeting(user_id: str, email_id: str) -> dict | None:
+    """Mark a detected meeting as dismissed so the banner no longer appears."""
+    res = email_metadata_col().update_one(
+        {
+            "_id": email_id,
+            "user_id": user_id,
+            "detected_meeting": {"$exists": True, "$ne": None},
+        },
+        {"$set": {"meeting_status": "dismissed"}},
+    )
+    if not res.matched_count:
+        return None
+    return get_email(user_id, email_id)
+
+
 # ── Send / Reply / Forward via SMTP ─────────────────────────────────────────
 
 def send_email(user_id: str, data: dict) -> dict:
@@ -527,9 +837,11 @@ def send_email(user_id: str, data: dict) -> dict:
     if data.get("cc"):
         msg["Cc"] = ", ".join(data["cc"])
     msg["Subject"] = data["subject"]
+    msg["Message-ID"] = _sender_msgid(mb)
     msg.attach(MIMEText(data["body"], "plain"))
 
     _smtp_send(mb, msg)
+    mailbox_services.append_sent_to_imap(user_id, data["mailbox_id"], msg.as_bytes())
 
     sent_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
@@ -608,31 +920,62 @@ def reply_email(user_id: str, email_id: str, data: dict) -> dict:
     if not mb:
         raise ValueError("Mailbox not found")
 
-    to_list = data.get("to") if isinstance(data.get("to"), list) else [content.get("from_email", "")]
-    if not to_list and content.get("from_email"):
-        to_list = [content["from_email"]]
-    to_str = ", ".join(to_list) if to_list else ""
-    subject = data.get("subject") or f"Re: {content.get('subject', '')}"
+    raw_to = data.get("to")
+    if isinstance(raw_to, str):
+        to_list = [raw_to]
+    elif isinstance(raw_to, list):
+        to_list = list(raw_to)
+    else:
+        to_list = []
+    to_list = [t.strip() for t in to_list if t and str(t).strip()]
+    if not to_list:
+        fallback = (content.get("from_email") or meta.get("from_email") or "").strip()
+        if fallback:
+            to_list = [fallback]
+    if not to_list:
+        raise ValueError(
+            "Cannot determine reply recipient — original sender email missing. "
+            "Provide an explicit 'to' address."
+        )
+    to_str = ", ".join(to_list)
+
+    cc_list = data.get("cc") or []
+    if isinstance(cc_list, str):
+        cc_list = [cc_list]
+    cc_list = [c.strip() for c in cc_list if c and str(c).strip()]
+
+    original_subject = content.get("subject", "") or meta.get("subject", "") or ""
+    raw_subject = (data.get("subject") or "").strip() or original_subject
+    subject = _ensure_prefix(raw_subject, "Re:")
+
+    reply_body = (data.get("body") or "").strip()
+    if not reply_body:
+        raise ValueError("Reply body is required")
+    final_body = _compose_reply_with_quote(reply_body, content, meta)
 
     parent_mid = meta.get("message_id", "")
-    reply_msg_id = make_msgid()
+    reply_msg_id = _sender_msgid(mb)
     msg = MIMEMultipart()
     msg["From"] = mb["email"]
     msg["To"] = to_str
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
     msg["Subject"] = subject
     msg["Message-ID"] = reply_msg_id
-    msg["In-Reply-To"] = parent_mid
     if parent_mid:
+        msg["In-Reply-To"] = parent_mid
         msg["References"] = parent_mid
-    msg.attach(MIMEText(data["body"], "plain"))
+    msg.attach(MIMEText(final_body, "plain"))
 
     _smtp_send(mb, msg)
+    mailbox_services.append_sent_to_imap(user_id, data["mailbox_id"], msg.as_bytes())
     now_iso = datetime.now(timezone.utc).isoformat()
     sent_reply_doc = {
         "message_id": reply_msg_id.strip(),
-        "body": data["body"],
+        "body": reply_body,
         "subject": subject,
-        "to": to_list or [content.get("from_email", "")],
+        "to": to_list,
+        "cc": cc_list,
         "from_email": mb.get("email", ""),
         "date": now_iso,
     }
@@ -659,17 +1002,57 @@ def forward_email(user_id: str, email_id: str, data: dict) -> dict:
     if not mb:
         raise ValueError("Mailbox not found")
 
-    body = _reassemble_body(email_id, user_id)
-    full_body = f"{data.get('body', '')}\n\n--- Forwarded message ---\n{body}"
+    to_list = data.get("to") or []
+    if isinstance(to_list, str):
+        to_list = [to_list]
+    to_list = [t.strip() for t in to_list if t and str(t).strip()]
+    if not to_list:
+        raise ValueError("Recipient (to) is required for forward_email")
+
+    cc_list = data.get("cc") or []
+    if isinstance(cc_list, str):
+        cc_list = [cc_list]
+    cc_list = [c.strip() for c in cc_list if c and str(c).strip()]
+
+    original_subject = content.get("subject", "") or meta.get("subject", "") or ""
+    raw_subject = (data.get("subject") or "").strip() or original_subject
+    fwd_subject = _ensure_prefix(raw_subject, "Fwd:")
+
+    body = _reassemble_body(email_id, user_id) or ""
+    intro = (data.get("body") or "").strip()
+    header_lines = [
+        "--- Forwarded message ---",
+        f"From: {content.get('from_name', '')} <{content.get('from_email', '')}>".strip(),
+        f"Date: {meta.get('date', '')}",
+        f"Subject: {original_subject}",
+    ]
+    to_field = content.get("to", []) or []
+    if to_field:
+        header_lines.append(
+            "To: " + ", ".join(
+                t.get("email", "") if isinstance(t, dict) else str(t)
+                for t in to_field
+            )
+        )
+    full_body = (
+        (intro + "\n\n" if intro else "")
+        + "\n".join(header_lines)
+        + "\n\n"
+        + body
+    )
 
     msg = MIMEMultipart()
     msg["From"] = mb["email"]
-    msg["To"] = ", ".join(data["to"])
-    msg["Subject"] = f"Fwd: {content.get('subject', '')}"
+    msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+    msg["Subject"] = fwd_subject
+    msg["Message-ID"] = _sender_msgid(mb)
     msg.attach(MIMEText(full_body, "plain"))
 
     _smtp_send(mb, msg)
-    return {"status": "sent", "to": data["to"], "subject": msg["Subject"]}
+    mailbox_services.append_sent_to_imap(user_id, data["mailbox_id"], msg.as_bytes())
+    return {"status": "sent", "to": to_list, "cc": cc_list, "subject": fwd_subject}
 
 
 # ── Delete conversation reply ─────────────────────────────────────────────────
@@ -764,7 +1147,54 @@ def _reassemble_body(email_id: str, user_id: str) -> str:
     return "\n".join(p.payload.get("body_chunk", "") for p in sorted_chunks)
 
 
+def _ensure_prefix(subject: str, prefix: str) -> str:
+    """Prepend ``prefix`` (e.g. 'Re:' / 'Fwd:') only if it isn't already there.
+
+    Case-insensitive and tolerant of extra whitespace so we don't end up with
+    'Re: Re: Re: ...' chains when replying to a reply, or 'Fwd: Fwd: ...' when
+    forwarding an already-forwarded email.
+    """
+    subj = (subject or "").strip()
+    low = subj.lower()
+    p = prefix.strip().lower().rstrip(":")
+    if low.startswith(p + ":") or low.startswith(p + " :"):
+        return subj
+    return f"{prefix.strip()} {subj}".strip()
+
+
+def _compose_reply_with_quote(reply_body: str, content: dict, meta: dict) -> str:
+    """Append a standard quoted block of the original email below the reply."""
+    original_body = (content.get("body_chunk") or "").strip()
+    if not original_body:
+        return reply_body
+
+    from_line = (
+        f"{content.get('from_name', '')} <{content.get('from_email', '')}>".strip()
+        or content.get("from_email", "")
+        or "(unknown sender)"
+    )
+    date_val = meta.get("original_date") or meta.get("date")
+    if isinstance(date_val, datetime):
+        date_str = date_val.strftime("%a, %b %d, %Y at %I:%M %p")
+    else:
+        date_str = str(date_val or "")
+
+    header = f"On {date_str}, {from_line} wrote:".strip()
+    # Cap quoted original to keep SMTP payload small — most replies only need
+    # context, not the entire thread history.
+    quote_src = original_body[:4000]
+    quoted = "\n".join(f"> {line}" for line in quote_src.splitlines())
+    return f"{reply_body.strip()}\n\n{header}\n{quoted}"
+
+
 def _smtp_send(mb: dict, msg):
+    """Send an email via SMTP and raise on refused recipients.
+
+    smtplib.send_message() returns a dict of recipients that were refused but
+    it does NOT raise unless EVERY recipient was refused. We treat any refusal
+    as a hard error so the user isn't told "sent" when the real recipient
+    silently dropped off.
+    """
     password = decrypt(mb["encrypted_password"])
     use_ssl = mb.get("smtp_secure", True)
     port = mb["smtp_port"]
@@ -778,9 +1208,26 @@ def _smtp_send(mb: dict, msg):
 
     try:
         server.login(mb["username"], password)
-        server.send_message(msg)
+        refused = server.send_message(msg) or {}
     finally:
         server.quit()
+
+    if refused:
+        details = ", ".join(f"{r}: {v}" for r, v in refused.items())
+        raise ValueError(f"SMTP refused recipient(s): {details}")
+
+
+def _sender_msgid(mb: dict) -> str:
+    """Generate a Message-ID using the sender's real domain.
+
+    The default ``email.utils.make_msgid()`` uses ``@localhost`` which many
+    spam filters (especially Gmail / Outlook / corporate filters) reject or
+    flag. Using the authenticated mailbox domain dramatically improves
+    deliverability and thread reassembly on the receiving side.
+    """
+    sender = (mb.get("email") or "").strip()
+    domain = sender.split("@", 1)[1] if "@" in sender else "localhost"
+    return make_msgid(domain=domain)
 
 
 def get_attachment(user_id: str, email_id: str, attachment_index: int) -> dict | None:
@@ -817,6 +1264,27 @@ def diagnose_missing_attachment(user_id: str, email_id: str, attachment_index: i
     return f"index_{attachment_index}_missing (stored indices: {indices})"
 
 
+def _serialize_detected_meeting(dm: dict | None) -> dict | None:
+    """Turn stored detected_meeting (with datetime objects) into JSON-safe dict."""
+    if not dm or not isinstance(dm, dict):
+        return None
+    start = dm.get("start")
+    end = dm.get("end")
+    if isinstance(start, datetime):
+        start = start.isoformat()
+    if isinstance(end, datetime):
+        end = end.isoformat()
+    if not start or not end:
+        return None
+    return {
+        "title": dm.get("title") or "Meeting",
+        "start": start,
+        "end": end,
+        "location": dm.get("location"),
+        "attendees": dm.get("attendees") or [],
+    }
+
+
 def _merge_email(mongo_doc: dict, qdrant_content: dict) -> dict:
     """Merge MongoDB mutable state with Qdrant immutable content."""
     priority = mongo_doc.get("priority") or qdrant_content.get("priority", "medium")
@@ -846,4 +1314,6 @@ def _merge_email(mongo_doc: dict, qdrant_content: dict) -> dict:
         "replied_at": mongo_doc.get("replied_at"),
         "snoozed_until": mongo_doc.get("snoozed_until"),
         "thread_count": thread_count,
+        "detected_meeting": _serialize_detected_meeting(mongo_doc.get("detected_meeting")),
+        "meeting_status": mongo_doc.get("meeting_status") or None,
     }

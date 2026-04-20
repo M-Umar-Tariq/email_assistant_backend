@@ -161,6 +161,15 @@ def email_trash(request, email_id):
 
 @api_view(["POST"])
 @jwt_required
+def email_move_to_inbox(request, email_id):
+    ok = services.move_email_to_inbox(request.user_id, email_id)
+    if not ok:
+        return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+    return Response({"status": "moved_to_inbox"})
+
+
+@api_view(["POST"])
+@jwt_required
 def email_spam(request, email_id):
     ok = services.spam_email(request.user_id, email_id)
     if not ok:
@@ -175,6 +184,117 @@ def email_delete(request, email_id):
     if not ok:
         return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
     return Response({"status": "deleted"})
+
+
+# ── Bulk endpoints ──────────────────────────────────────────────────────────
+#
+# One request → one service call → one Mongo batch + one IMAP session per
+# mailbox. Prevents the 10s+ delays that occurred when the client fired 50
+# individual per-email HTTP requests.
+
+
+def _parse_bulk_ids(request) -> tuple[list[str] | None, Response | None]:
+    body = request.data if isinstance(request.data, dict) else {}
+    raw = body.get("email_ids")
+    if not isinstance(raw, list) or not raw:
+        return None, Response(
+            {"error": "email_ids must be a non-empty list"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    cleaned = [str(x) for x in raw if isinstance(x, (str, int)) and str(x).strip()]
+    if not cleaned:
+        return None, Response(
+            {"error": "email_ids must be a non-empty list"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return cleaned, None
+
+
+@api_view(["POST"])
+@jwt_required
+def email_bulk_archive(request):
+    ids, err = _parse_bulk_ids(request)
+    if err:
+        return err
+    return Response(services.bulk_archive_emails(request.user_id, ids))
+
+
+@api_view(["POST"])
+@jwt_required
+def email_bulk_trash(request):
+    ids, err = _parse_bulk_ids(request)
+    if err:
+        return err
+    return Response(services.bulk_trash_emails(request.user_id, ids))
+
+
+@api_view(["POST"])
+@jwt_required
+def email_bulk_spam(request):
+    ids, err = _parse_bulk_ids(request)
+    if err:
+        return err
+    return Response(services.bulk_spam_emails(request.user_id, ids))
+
+
+@api_view(["POST"])
+@jwt_required
+def email_bulk_move_to_inbox(request):
+    ids, err = _parse_bulk_ids(request)
+    if err:
+        return err
+    return Response(services.bulk_move_to_inbox_emails(request.user_id, ids))
+
+
+@api_view(["POST"])
+@jwt_required
+def email_bulk_delete(request):
+    ids, err = _parse_bulk_ids(request)
+    if err:
+        return err
+    return Response(services.bulk_delete_emails(request.user_id, ids))
+
+
+@api_view(["POST"])
+@jwt_required
+def email_bulk_update(request):
+    ids, err = _parse_bulk_ids(request)
+    if err:
+        return err
+    body = request.data if isinstance(request.data, dict) else {}
+    data: dict = {}
+    if "read" in body:
+        data["read"] = bool(body["read"])
+    if "starred" in body:
+        data["starred"] = bool(body["starred"])
+    if not data:
+        return Response(
+            {"error": "Provide at least one of: read, starred"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(services.bulk_update_emails(request.user_id, ids, data))
+
+
+@api_view(["POST"])
+@jwt_required
+def email_bulk_snooze(request):
+    ids, err = _parse_bulk_ids(request)
+    if err:
+        return err
+    body = request.data if isinstance(request.data, dict) else {}
+    try:
+        hours = int(body.get("hours"))
+    except (TypeError, ValueError):
+        return Response(
+            {"error": "hours must be an integer"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if hours <= 0:
+        return Response(
+            {"error": "hours must be a positive integer"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(services.bulk_snooze_emails(request.user_id, ids, hours))
 
 
 @api_view(["POST"])
@@ -232,6 +352,44 @@ def email_delete_sent_reply(request, email_id, reply_index):
     if not result:
         return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
     return Response(result)
+
+
+@api_view(["GET"])
+@jwt_required
+def email_with_meetings(request):
+    """Emails whose AI-detected meeting the user may add to the calendar.
+
+    Query params: `mailbox_id` (optional), `status` (pending|added|dismissed).
+    """
+    mb = request.query_params.get("mailbox_id") or None
+    status_f = request.query_params.get("status") or None
+    data = services.list_emails_with_meetings(
+        request.user_id, mailbox_id=mb, status_filter=status_f
+    )
+    return Response(data)
+
+
+@api_view(["POST"])
+@jwt_required
+def email_add_meeting(request, email_id):
+    """Promote an email's detected meeting into a real calendar event."""
+    result = services.add_detected_meeting_to_calendar(request.user_id, email_id)
+    if not result:
+        return Response(
+            {"error": "No detected meeting on this email"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    return Response(result, status=status.HTTP_201_CREATED)
+
+
+@api_view(["POST"])
+@jwt_required
+def email_dismiss_meeting(request, email_id):
+    """Dismiss an email's detected meeting — removes the approval banner."""
+    email = services.dismiss_detected_meeting(request.user_id, email_id)
+    if not email:
+        return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+    return Response(email)
 
 
 @api_view(["GET"])

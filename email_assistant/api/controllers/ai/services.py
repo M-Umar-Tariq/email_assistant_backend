@@ -136,18 +136,19 @@ _NEEDS_CONTENT_RE = re.compile(
     r"|reply|forward|send|compose|draft|write|search|find|list)\b",
     re.I,
 )
-_REFERENCE_RE = re.compile(
-    r"\b(?:it|this|that|first|1st|latest|newest|most\s+recent|above|previous|last\s+one)\b",
-    re.I,
-)
 
 
 def _is_fast_action(query: str) -> bool:
-    """True for pure state-changing actions that don't need email bodies in the prompt."""
+    """True for pure state-changing actions that don't need email bodies in the prompt.
+
+    Reference words like "it / this / that / latest / first" are NOT a reason to
+    leave the fast path: in fast mode we still provide a compact list of recent
+    emails (newest first), and chat history gives the AI enough signal to
+    resolve pronouns like "mark it as read" back to the right email ID.
+    """
     return (
         bool(_FAST_ACTION_VERBS.search(query))
         and not _NEEDS_CONTENT_RE.search(query)
-        and not _REFERENCE_RE.search(query)
     )
 
 
@@ -422,8 +423,22 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
     time_label = ""
 
     if is_fast:
-        contents, metas = [], []
-        sources = []
+        # Fast actions (mark read/unread, trash, archive, snooze, delete) don't
+        # need full email bodies in the prompt, but the AI still needs IDs so it
+        # can target *specific* emails when the user says things like
+        # "mark these 3 emails as read", "mark today's emails as read", or
+        # "mark the two Amazon emails as read". We provide a compact recent
+        # slice of the inbox — optionally narrowed by detected time range —
+        # and use the compact email block for low token cost.
+        time_label, start_dt, end_dt = _detect_time_range(query, tz)
+        contents, metas = _fetch_emails_by_date(
+            user_id, start_dt, end_dt, mailbox_id,
+            limit=0 if time_label else 25,
+        )
+        # Cap the list so the prompt stays small even if the time range is wide.
+        if len(contents) > 50:
+            contents = contents[:50]
+            metas = metas[:50]
     else:
         time_label, start_dt, end_dt = _detect_time_range(query, tz)
         broad = _is_broad_query(query)
@@ -460,11 +475,13 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
 
     if contents:
         FULL_CUTOFF = 35
-        use_compact = len(contents) > FULL_CUTOFF
+        # For fast state-change actions we never need full bodies — the AI only
+        # needs IDs + headers to target specific emails.
+        use_compact = is_fast or len(contents) > FULL_CUTOFF
         context_blocks = []
         sources = []
         for i, (c, m) in enumerate(zip(contents, metas)):
-            if use_compact and i >= FULL_CUTOFF:
+            if use_compact or (len(contents) > FULL_CUTOFF and i >= FULL_CUTOFF):
                 context_blocks.append(_build_email_block_compact(c, m, tz))
             else:
                 context_blocks.append(_build_email_block_full(c, m, tz))
@@ -476,7 +493,7 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
         context = separator.join(context_blocks)
     else:
         use_compact = False
-        context = "(No email content loaded — use filter params: from_email, subject, or keywords to target emails.)"
+        context = "(No email content loaded — use filter params: from_email, subject, keywords, read, date_from, date_to, or limit to target emails.)"
 
     now = datetime.now(timezone.utc)
     if tz:
@@ -553,25 +570,51 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
         '"description":"details","requires_approval":true}]\n'
         "```\n\n"
         "ALL ACTION TYPES (use the exact type string):\n\n"
-        "TARGETING: Every action that operates on emails accepts these filter params:\n"
-        "  - email_id: target ONE specific email (use the ID from context).\n"
-        "  - from_email: target ALL emails from this sender address.\n"
-        "  - subject: target ALL emails whose subject matches (substring).\n"
-        "  - keywords: target ALL emails matching keywords in subject or preview.\n"
-        "  For a single email, use email_id. For bulk (e.g. 'all emails from X'), use from_email/subject/keywords. "
-        "Do NOT list many individual email_ids — use a filter instead.\n\n"
+        "TARGETING (applies to mark_read, mark_unread, trash_email, delete_email, "
+        "archive_email, snooze_email, open_email, forward_email, etc.):\n"
+        "  - email_id:  ONE specific email — use the ID shown in the context.\n"
+        "  - email_ids: [\"id1\",\"id2\",...] — TWO OR MORE specific emails from the context.\n"
+        "  - from_email: ALL emails from this sender address.\n"
+        "  - subject:   ALL emails whose subject matches (case-insensitive substring).\n"
+        "  - keywords:  ALL emails matching keywords in subject or preview.\n"
+        "  - read:      true / false — filter by read state (e.g. only unread ones).\n"
+        "  - date_from, date_to: ISO datetime strings — restrict to a date range.\n"
+        "  - limit:     max number of emails affected (e.g. 'mark the latest 5 as read').\n"
+        "\n"
+        "HOW TO PICK THE RIGHT TARGETING:\n"
+        "  1. User points at emails visible in the context OR referenced in a PREVIOUS\n"
+        "     assistant turn (\"this email\", \"it\", \"that one\", \"ye wala\", \"woh mail\",\n"
+        "     \"the Amazon one\", \"these 3 emails\", \"first email\", \"latest email\"):\n"
+        "     use email_id for one, email_ids for two or more. Previous assistant turns\n"
+        "     include a bracketed `[Emails referenced in this turn: ...]` block — use those\n"
+        "     exact IDs to resolve pronouns. NEVER invent IDs — only use IDs from the\n"
+        "     current EMAIL CONTEXT or a previous referenced-emails block.\n"
+        "  2. User describes a sender (\"all emails from John\", \"John ki emails\"): from_email.\n"
+        "  3. User describes a topic / subject (\"all Amazon emails\", \"newsletters\"): subject or keywords.\n"
+        "  4. User describes a time range (\"today's emails\", \"aaj ki emails\", \"last week\"): date_from + date_to.\n"
+        "  5. User describes read state (\"all unread emails as read\"): use mark_all_read, "
+        "or mark_read with read=false to target only unread ones.\n"
+        "  6. User asks for a count (\"mark the latest 5 as read\"): combine filters with limit.\n"
+        "  7. For EVERY email in the inbox with no other filter: use mark_all_read / mark_all_unread "
+        "(do NOT list IDs).\n"
+        "Combine params when needed — e.g. mark_read with from_email + read=false marks only\n"
+        "unread emails from that sender as read.\n\n"
         "- read_emails: fetch inbox emails. Extra params: unread_only, limit, folder.\n"
         "- open_email: open a specific email. Needs email_id.\n"
         "- open_latest_email: open the most recent email.\n"
         "- search_emails: search by query. Extra params: query (REQUIRED), limit.\n"
-        "- send_email: send a new email. Params: to (REQUIRED), subject, body, cc, mailbox_id.\n"
-        "- draft_email: prepare a draft (not sent). Params: to, subject, body, mailbox_id.\n"
+        "- send_email: send a new email. Required: to, subject, body. Optional: cc, mailbox_id.\n"
+        "- draft_email: prepare a draft (not sent). Params: to, subject, body, cc, mailbox_id.\n"
         "- draft_reply: AI-generate a reply draft. Needs email_id + instructions.\n"
-        "- send_reply: send a reply. Needs email_id + body or instructions, mailbox_id.\n"
-        "- reply_all: reply to all. Needs email_id + body (REQUIRED), mailbox_id.\n"
-        "- forward_email: forward. Needs email_id + to (REQUIRED), body (optional), mailbox_id.\n"
+        "- send_reply: send a reply. Required: email_id + body (the full reply text, ready to send). "
+        "Optional: subject, cc, mailbox_id. Only omit body and pass instructions if the user "
+        "EXPLICITLY says 'reply automatically' / 'auto-draft and send'.\n"
+        "- reply_all: reply to all. Required: email_id + body (full text). Optional: subject, mailbox_id.\n"
+        "- forward_email: forward an email. Required: email_id + to. Optional: cc, body (message "
+        "above the forwarded content), mailbox_id.\n"
         "- trash_email: move to trash. Accepts email_id OR from_email/subject/keywords for bulk.\n"
-        "- delete_email: permanently delete. Accepts email_id OR filters for bulk.\n"
+        "- delete_email: same as trash_email — move to trash (not permanent erase). "
+        "Accepts email_id OR filters for bulk.\n"
         "- archive_email: archive. Accepts email_id OR filters for bulk.\n"
         "- mark_read: mark as read. Accepts email_id OR from_email/subject/keywords for bulk.\n"
         "- mark_unread: mark as unread. Accepts email_id OR filters for bulk.\n"
@@ -583,15 +626,31 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
         "ACTION RULES:\n"
         "1. ALWAYS set requires_approval=true — the user must confirm before execution.\n"
         "2. Be proactive — when the user asks to do something, emit the action block immediately.\n"
-        "3. For a single email use its ID from context. For bulk by sender use from_email. Never list many IDs.\n"
+        "3. Pick targeting per the rules above: one ID → email_id, a handful of "
+        "specific emails → email_ids, a whole group → from_email/subject/keywords/date/read filters.\n"
         "4. Respond in the same language the user speaks.\n"
         "5. Use send_reply for replies, reply_all for reply-all, send_email for NEW messages.\n"
         "6. Use trash_email for delete/remove/trash. Use archive_email for archive.\n"
         "7. For ALL inbox read/unread with no sender filter use mark_all_read / mark_all_unread.\n"
         "8. RECIPIENT RESOLUTION: When the user says a name, look up email from KEY CONTACTS. "
         "If multiple match, list ALL and ask the user to pick.\n"
-        "9. SENDER CONFIRMATION: Before send_email/send_reply/forward_email, state From, To, Subject. "
-        "If multiple mailboxes, ask which one.\n\n"
+        "9. COMPOSE PREVIEW: For send_email / send_reply / reply_all / forward_email, the JSON "
+        "action MUST carry the complete, ready-to-send content so the user can review BEFORE "
+        "approving. Concretely:\n"
+        "     • to: the resolved recipient email address(es) — never a name placeholder.\n"
+        "     • subject: the actual subject line (for replies, reuse the original subject; "
+        "   the backend adds 'Re:' automatically if missing).\n"
+        "     • body: the full message text the user would send. Plain text, no markdown code\n"
+        "   fences, no 'Here is the draft:' preamble, no explanatory wrapper — ONLY the email body.\n"
+        "     • cc: optional, only if the user asked for a CC.\n"
+        "   Also briefly show From / To / Subject / a one-line summary in your chat reply so the\n"
+        "   user sees what they're approving, but the authoritative content lives in the JSON.\n"
+        "10. If the user's request is ambiguous (\"reply to him\" with no context, no body hint),\n"
+        "    ask ONE clarifying question instead of guessing. Only emit the action once you have\n"
+        "    enough info to produce a sendable draft.\n"
+        "11. If multiple mailboxes exist and the user hasn't picked one, set mailbox_id to the\n"
+        "    most contextually appropriate (e.g. the mailbox that received the original email "
+        "    you're replying to).\n\n"
         "SCOPE: You are strictly an EMAIL assistant. Gently redirect off-topic questions.\n\n"
         f"EMAIL CONTEXT ({len(contents)} emails):\n\n{context}"
     )
@@ -600,10 +659,31 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
 
     if history:
         for m in history[-8:]:
-            messages.append({
-                "role": m.get("role", "user"),
-                "content": m.get("content", ""),
-            })
+            raw_role = (m.get("role") or "user").lower()
+            role = "assistant" if raw_role in ("assistant", "ai", "bot") else "user"
+            content = (m.get("content") or "").strip()
+            # Inject previously-cited email IDs into assistant turns so follow-ups
+            # like "mark it as read" / "delete that email" can be resolved against
+            # the exact emails referenced earlier in the conversation.
+            if role == "assistant":
+                srcs = m.get("sources") or []
+                hint_lines = []
+                for s in srcs:
+                    if not isinstance(s, dict):
+                        continue
+                    eid = s.get("email_id") or s.get("emailId") or ""
+                    subj = s.get("subject") or ""
+                    if eid:
+                        hint_lines.append(f'  - ID: {eid}  Subject: "{subj}"')
+                if hint_lines:
+                    content += (
+                        "\n\n[Emails referenced in this turn — use these exact IDs "
+                        "when the user follows up with pronouns like 'it', 'this', "
+                        "'that', 'these', or 'yeh/woh/ye wala':\n"
+                        + "\n".join(hint_lines)
+                        + "]"
+                    )
+            messages.append({"role": role, "content": content})
 
     messages.append({"role": "user", "content": query})
 

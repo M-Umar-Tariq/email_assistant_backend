@@ -6,6 +6,8 @@ Supports read/open/search actions, compose/reply/forward, and mailbox actions.
 import re
 from datetime import datetime, timezone, timedelta
 
+from bson import ObjectId
+
 from database.db import mailboxes_col, follow_ups_col, email_metadata_col
 from api.utils.qdrant_helpers import get_email_content, get_email_ids_by_sender
 from api.utils.llm import chat
@@ -60,32 +62,96 @@ def _resolve_email_ids(user_id: str, action: dict) -> list[str]:
     """Resolve an action's target to concrete email IDs.
 
     Priority:
-    1. Explicit ``email_id`` → single-item list.
-    2. ``from_email`` → all inbox emails from that sender (via Qdrant).
-    3. ``subject`` / ``keywords`` → regex match on MongoDB metadata.
+    1. ``email_ids`` (list) → all of them (deduped, kept in order, existence-checked).
+    2. ``email_id`` (single) → single-item list.
+    3. Filter combination: ``from_email`` / ``subject`` / ``keywords`` /
+       ``read`` / ``date_from`` / ``date_to`` / ``mailbox_id`` / ``limit``.
+       At least one filter must be supplied for bulk to return anything.
 
     Returns an empty list when nothing matches.
     """
+    col = email_metadata_col()
+
+    # 1) Explicit list of IDs
+    raw_list = action.get("email_ids")
+    if isinstance(raw_list, list) and raw_list:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in raw_list:
+            if not item:
+                continue
+            s = str(item).strip().strip("`'\" ")
+            if s and s not in seen:
+                seen.add(s)
+                cleaned.append(s)
+        if cleaned:
+            existing = {
+                str(d["_id"])
+                for d in col.find(
+                    {"_id": {"$in": cleaned}, "user_id": user_id},
+                    {"_id": 1},
+                )
+            }
+            resolved = [c for c in cleaned if c in existing]
+            if resolved:
+                return resolved
+
+    # 2) Single explicit ID
     single = (action.get("email_id") or "").strip()
     if single:
-        col = email_metadata_col()
         if col.find_one({"_id": single, "user_id": user_id}, {"_id": 1}):
             return [single]
-        cleaned = single.strip("`'\" ")
-        if cleaned and col.find_one({"_id": cleaned, "user_id": user_id}, {"_id": 1}):
-            return [cleaned]
+        cleaned_id = single.strip("`'\" ")
+        if cleaned_id and col.find_one({"_id": cleaned_id, "user_id": user_id}, {"_id": 1}):
+            return [cleaned_id]
 
+    # 3) Filters
     sender = (action.get("from_email") or "").strip()
     subj = (action.get("subject") or "").strip()
     kw = (action.get("keywords") or "").strip()
+    label = (action.get("label_name") or action.get("label") or "").strip()
+    folder = (action.get("folder") or "").strip().lower()
     mb = action.get("mailbox_id") or None
 
-    candidate_ids: list[str] | None = None
+    read_val = action.get("read")
+    read_filter: bool | None
+    if isinstance(read_val, bool):
+        read_filter = read_val
+    elif isinstance(read_val, str) and read_val.strip().lower() in ("true", "false"):
+        read_filter = read_val.strip().lower() == "true"
+    elif action.get("unread_only"):
+        read_filter = False
+    else:
+        read_filter = None
 
+    date_from = _parse_iso_dt(action.get("date_from"))
+    date_to = _parse_iso_dt(action.get("date_to"))
+
+    try:
+        limit_val = int(action.get("limit") or 0)
+    except (TypeError, ValueError):
+        limit_val = 0
+
+    candidate_ids: list[str] | None = None
     if sender:
         candidate_ids = get_email_ids_by_sender(user_id, sender, mb)
 
-    query: dict = {"user_id": user_id, "archived": False, "trashed": False}
+    query: dict = {"user_id": user_id}
+    if folder == "trash":
+        query.update({"trashed": True, "$or": [{"spam": {"$ne": True}}, {"spam": {"$exists": False}}]})
+    elif folder == "spam":
+        query.update({"spam": True})
+    elif folder == "sent":
+        query.update({"is_sent": True})
+    elif folder == "archive":
+        query.update({"archived": True, "trashed": False})
+    elif folder == "star":
+        query.update({"starred": True, "trashed": False})
+    elif folder == "snoozed":
+        query.update({"trashed": False, "snoozed_until": {"$gt": datetime.now(timezone.utc)}})
+    else:
+        # Inbox/default scope.
+        query.update({"archived": False, "trashed": False})
     if mb:
         query["mailbox_id"] = mb
 
@@ -101,16 +167,67 @@ def _resolve_email_ids(user_id: str, action: dict) -> list[str]:
     if ands:
         query["$and"] = ands
 
+    if read_filter is not None:
+        query["read"] = read_filter
+    if label:
+        query["labels"] = label
+
+    if date_from or date_to:
+        date_range: dict = {}
+        if date_from:
+            date_range["$gte"] = date_from
+        if date_to:
+            date_range["$lte"] = date_to
+        query["date"] = date_range
+
     if candidate_ids is not None:
         if not candidate_ids:
             return []
         query["_id"] = {"$in": candidate_ids}
 
-    if candidate_ids is None and not ands:
+    # Require at least one targeting signal before returning bulk matches.
+    has_filter = (
+        candidate_ids is not None
+        or bool(ands)
+        or read_filter is not None
+        or bool(label)
+        or bool(folder)
+        or date_from is not None
+        or date_to is not None
+    )
+    if not has_filter:
         return []
 
-    col = email_metadata_col()
-    return [str(d["_id"]) for d in col.find(query, {"_id": 1})]
+    cursor = col.find(query, {"_id": 1}).sort("date", -1)
+    if limit_val > 0:
+        cursor = cursor.limit(limit_val)
+    return [str(d["_id"]) for d in cursor]
+
+
+def _resolve_single_email_id(user_id: str, action: dict) -> str:
+    """Return one concrete email_id for an action targeting a single email.
+
+    Priority:
+      1. Explicit ``email_id`` if it exists in MongoDB (with trimmed fallback).
+      2. First entry of ``email_ids`` list if present and valid.
+      3. First (latest-by-date) match from ``_resolve_email_ids`` using
+         ``from_email`` / ``subject`` / ``keywords`` / date / read filters.
+
+    Returns "" when nothing matches — caller decides whether to raise.
+    """
+    raw_id = (action.get("email_id") or "").strip()
+    if raw_id:
+        col = email_metadata_col()
+        if col.find_one({"_id": raw_id, "user_id": user_id}, {"_id": 1}):
+            return raw_id
+        cleaned = raw_id.strip("`'\" ")
+        if cleaned and cleaned != raw_id and col.find_one(
+            {"_id": cleaned, "user_id": user_id}, {"_id": 1}
+        ):
+            return cleaned
+
+    ids = _resolve_email_ids(user_id, {**action, "email_id": ""})
+    return ids[0] if ids else ""
 
 
 # Read / Open / Search
@@ -137,19 +254,30 @@ def _exec_read_emails(user_id: str, action: dict) -> dict:
 
 
 def _exec_open_email(user_id: str, action: dict) -> dict:
-    from api.controllers.emails.services import get_email
+    from api.controllers.emails.services import get_email, update_email
 
-    email_id = (action.get("email_id") or "").strip()
+    email_id = _resolve_single_email_id(user_id, action)
     if not email_id:
-        raise ValueError("email_id is required for open_email")
+        raise ValueError(
+            "No matching email found. Provide email_id, from_email, subject, or keywords."
+        )
     result = get_email(user_id, email_id)
     if not result:
         raise ValueError("Email not found")
+
+    if not result.get("read"):
+        try:
+            updated = update_email(user_id, email_id, {"read": True})
+            if updated:
+                result = updated
+        except Exception:
+            pass
+
     return {"details": "Opened email", "email": result}
 
 
 def _exec_open_latest_email(user_id: str, action: dict) -> dict:
-    from api.controllers.emails.services import list_emails
+    from api.controllers.emails.services import list_emails, get_email, update_email
 
     date_from = _parse_iso_dt(action.get("date_from"))
     date_to = _parse_iso_dt(action.get("date_to"))
@@ -167,7 +295,21 @@ def _exec_open_latest_email(user_id: str, action: dict) -> dict:
     )
     if not items:
         raise ValueError("No matching emails found")
-    return {"details": "Opened latest email", "email": items[0]}
+
+    top = items[0]
+    email_id = str(top.get("id") or top.get("_id") or "")
+    if email_id:
+        full = get_email(user_id, email_id) or top
+        if not full.get("read"):
+            try:
+                updated = update_email(user_id, email_id, {"read": True})
+                if updated:
+                    full = updated
+            except Exception:
+                pass
+        return {"details": "Opened latest email", "email": full}
+
+    return {"details": "Opened latest email", "email": top}
 
 
 def _exec_search_emails(user_id: str, action: dict) -> dict:
@@ -217,25 +359,38 @@ def _exec_send_email(user_id: str, action: dict) -> dict:
     cc_field = action.get("cc", [])
     if isinstance(cc_field, str):
         cc_field = [cc_field]
+    cc_field = [c.strip() for c in cc_field if c and str(c).strip()]
+
+    subject = (action.get("subject") or "").strip()
+    body = _sanitize_draft_body(action.get("body") or "")
+    if not subject:
+        raise ValueError("Subject is required for send_email")
+    if not body:
+        raise ValueError("Body is required for send_email")
 
     data = {
         "mailbox_id": mailbox_id,
         "to": to_field,
         "cc": cc_field,
-        "subject": action.get("subject", ""),
-        "body": action.get("body", ""),
+        "subject": subject,
+        "body": body,
     }
     smtp_send(user_id, data)
-    return {"details": f"Email sent to {', '.join(to_field)}"}
+    details = f"Email sent to {', '.join(to_field)}"
+    if cc_field:
+        details += f" (cc: {', '.join(cc_field)})"
+    return {"details": details}
 
 
 def _exec_draft_reply(user_id: str, action: dict) -> dict:
     from api.controllers.settings.services import get_user_preferences_prompt
 
-    email_id = action.get("email_id", "")
+    email_id = _resolve_single_email_id(user_id, action)
     content = get_email_content(email_id, user_id) if email_id else None
     if not content:
-        raise ValueError("Email not found for reply")
+        raise ValueError(
+            "Email not found for reply. Provide email_id, from_email, subject, or keywords."
+        )
 
     context = (
         f"From: {content.get('from_name', '')} <{content.get('from_email', '')}>\n"
@@ -247,24 +402,28 @@ def _exec_draft_reply(user_id: str, action: dict) -> dict:
     style_note = f"\n{user_prefs}\nFollow the user's preferred draft style.\n" if user_prefs else ""
     draft = chat(
         system_prompt=(
-            "Draft a reply email. Match the formality of the original. Be concise and natural."
+            "Draft a reply email. Match the formality of the original. Be concise and natural. "
+            "Return ONLY the email body text (no subject, no metadata, no markdown code fences)."
             + style_note
         ),
         user_message=f"Original email:\n{context}\n\nInstructions: {instructions}",
         temperature=0.6,
     )
+    draft = _sanitize_draft_body(draft)
     return {"details": draft, "draft": draft}
 
 
 def _exec_send_reply(user_id: str, action: dict) -> dict:
     from api.controllers.emails.services import reply_email as do_reply
 
-    email_id = action.get("email_id", "")
+    email_id = _resolve_single_email_id(user_id, action)
     content = get_email_content(email_id, user_id) if email_id else None
     if not content:
-        raise ValueError("Email not found for reply")
+        raise ValueError(
+            "Email not found for reply. Provide email_id, from_email, subject, or keywords."
+        )
 
-    body = action.get("body", "").strip()
+    body = (action.get("body") or "").strip()
     if not body:
         from api.controllers.settings.services import get_user_preferences_prompt
 
@@ -279,33 +438,56 @@ def _exec_send_reply(user_id: str, action: dict) -> dict:
         body = chat(
             system_prompt=(
                 "Draft a reply email. Match the formality of the original. Be concise and natural. "
-                "Return ONLY the email body text (no subject, no metadata)."
+                "Return ONLY the email body text (no subject, no metadata, no markdown code fences, "
+                "no 'Here is the draft:' preamble)."
                 + style_note
             ),
             user_message=f"Original email:\n{context}\n\nInstructions: {instructions}",
             temperature=0.6,
         )
+    body = _sanitize_draft_body(body)
 
     mailbox_id = action.get("mailbox_id") or _default_mailbox_id(user_id)
-    do_reply(user_id, email_id, {"mailbox_id": mailbox_id, "body": body})
-    to_addr = content.get("from_email", "")
+    payload: dict = {"mailbox_id": mailbox_id, "body": body}
+    if action.get("subject"):
+        payload["subject"] = str(action["subject"]).strip()
+    cc = action.get("cc")
+    if isinstance(cc, str):
+        cc = [cc]
+    if isinstance(cc, list) and cc:
+        payload["cc"] = [c.strip() for c in cc if c and str(c).strip()]
+    to_override = action.get("to")
+    if isinstance(to_override, str):
+        to_override = [to_override]
+    if isinstance(to_override, list) and to_override:
+        payload["to"] = [t.strip() for t in to_override if t and str(t).strip()]
+
+    do_reply(user_id, email_id, payload)
+    to_addr = ", ".join(payload.get("to") or []) or content.get("from_email", "")
     return {"details": f"Reply sent to {to_addr}"}
 
 
 def _exec_reply_all(user_id: str, action: dict) -> dict:
     from api.controllers.emails.services import reply_email as do_reply
 
-    email_id = action.get("email_id", "")
+    email_id = _resolve_single_email_id(user_id, action)
     content = get_email_content(email_id, user_id) if email_id else None
     if not content:
-        raise ValueError("Email not found for reply_all")
+        raise ValueError(
+            "Email not found for reply_all. Provide email_id, from_email, subject, or keywords."
+        )
 
     mailbox_id = action.get("mailbox_id") or _default_mailbox_id(user_id)
+    mb = mailboxes_col().find_one({"_id": ObjectId(mailbox_id), "user_id": user_id})
+    own_email = (mb.get("email") or "").strip().lower() if mb else ""
+
     recipients = []
     seen = set()
+    if own_email:
+        seen.add(own_email)
 
     from_email = (content.get("from_email") or "").strip()
-    if from_email:
+    if from_email and from_email.lower() not in seen:
         recipients.append(from_email)
         seen.add(from_email.lower())
 
@@ -318,11 +500,20 @@ def _exec_reply_all(user_id: str, action: dict) -> dict:
             recipients.append(em)
             seen.add(em.lower())
 
-    body = (action.get("body") or "").strip()
+    body = _sanitize_draft_body(action.get("body") or "")
     if not body:
         raise ValueError("body is required for reply_all")
 
-    do_reply(user_id, email_id, {"mailbox_id": mailbox_id, "to": recipients, "body": body})
+    payload: dict = {"mailbox_id": mailbox_id, "to": recipients, "body": body}
+    if action.get("subject"):
+        payload["subject"] = str(action["subject"]).strip()
+    cc = action.get("cc")
+    if isinstance(cc, str):
+        cc = [cc]
+    if isinstance(cc, list) and cc:
+        payload["cc"] = [c.strip() for c in cc if c and str(c).strip()]
+
+    do_reply(user_id, email_id, payload)
     return {"details": f"Reply all sent to {', '.join(recipients)}"}
 
 
@@ -368,9 +559,10 @@ def _exec_set_reminder(user_id: str, action: dict) -> dict:
         hours = 24
     now = datetime.now(timezone.utc)
     due = now + timedelta(hours=hours)
+    email_id = _resolve_single_email_id(user_id, action)
     follow_ups_col().insert_one({
         "user_id": user_id,
-        "email_id": action.get("email_id", ""),
+        "email_id": email_id,
         "due_date": due,
         "status": "pending",
         "auto_reminder_sent": False,
@@ -387,9 +579,11 @@ def _exec_set_reminder(user_id: str, action: dict) -> dict:
 def _exec_forward_email(user_id: str, action: dict) -> dict:
     from api.controllers.emails.services import forward_email
 
-    email_id = (action.get("email_id") or "").strip()
+    email_id = _resolve_single_email_id(user_id, action)
     if not email_id:
-        raise ValueError("email_id is required for forward_email")
+        raise ValueError(
+            "No matching email found to forward. Provide email_id, from_email, subject, or keywords."
+        )
 
     mailbox_id = action.get("mailbox_id") or _default_mailbox_id(user_id)
     to_field = action.get("to", [])
@@ -399,26 +593,33 @@ def _exec_forward_email(user_id: str, action: dict) -> dict:
     if not to_field:
         raise ValueError("Recipient (to) is required for forward_email")
 
+    cc_field = action.get("cc", [])
+    if isinstance(cc_field, str):
+        cc_field = [cc_field]
+    cc_field = [c.strip() for c in cc_field if c and str(c).strip()]
+
     forward_email(user_id, email_id, {
         "mailbox_id": mailbox_id,
         "to": to_field,
-        "body": action.get("body", ""),
+        "cc": cc_field,
+        "subject": (action.get("subject") or "").strip(),
+        "body": _sanitize_draft_body(action.get("body") or ""),
     })
-    return {"details": f"Forwarded to {', '.join(to_field)}"}
+    details = f"Forwarded to {', '.join(to_field)}"
+    if cc_field:
+        details += f" (cc: {', '.join(cc_field)})"
+    return {"details": details}
 
 
 def _exec_trash_email(user_id: str, action: dict) -> dict:
-    from api.controllers.emails.services import trash_email as do_trash
+    from api.controllers.emails.services import bulk_trash_emails
 
     ids = _resolve_email_ids(user_id, action)
     if not ids:
         raise ValueError("No matching emails found. Provide email_id, from_email, subject, or keywords.")
-    done, fail = 0, 0
-    for eid in ids:
-        if do_trash(user_id, eid):
-            done += 1
-        else:
-            fail += 1
+    res = bulk_trash_emails(user_id, ids)
+    done = int(res.get("processed", 0) or 0)
+    fail = len(res.get("failed", []) or [])
     return {
         "details": f"Moved {done} email(s) to trash" + (f" ({fail} failed)" if fail else ""),
         "marked": done, "failed": fail,
@@ -426,17 +627,14 @@ def _exec_trash_email(user_id: str, action: dict) -> dict:
 
 
 def _exec_archive_email(user_id: str, action: dict) -> dict:
-    from api.controllers.emails.services import archive_email as do_archive
+    from api.controllers.emails.services import bulk_archive_emails
 
     ids = _resolve_email_ids(user_id, action)
     if not ids:
         raise ValueError("No matching emails found. Provide email_id, from_email, subject, or keywords.")
-    done, fail = 0, 0
-    for eid in ids:
-        if do_archive(user_id, eid):
-            done += 1
-        else:
-            fail += 1
+    res = bulk_archive_emails(user_id, ids)
+    done = int(res.get("processed", 0) or 0)
+    fail = len(res.get("failed", []) or [])
     return {
         "details": f"Archived {done} email(s)" + (f" ({fail} failed)" if fail else ""),
         "marked": done, "failed": fail,
@@ -444,17 +642,14 @@ def _exec_archive_email(user_id: str, action: dict) -> dict:
 
 
 def _exec_mark_read(user_id: str, action: dict) -> dict:
-    from api.controllers.emails.services import update_email
+    from api.controllers.emails.services import bulk_update_emails
 
     ids = _resolve_email_ids(user_id, action)
     if not ids:
         raise ValueError("No matching emails found. Provide email_id, from_email, subject, or keywords.")
-    done, fail = 0, 0
-    for eid in ids:
-        if update_email(user_id, eid, {"read": True}):
-            done += 1
-        else:
-            fail += 1
+    res = bulk_update_emails(user_id, ids, {"read": True})
+    done = int(res.get("processed", 0) or 0)
+    fail = len(res.get("failed", []) or [])
     return {
         "details": f"Marked {done} email(s) as read" + (f" ({fail} failed)" if fail else ""),
         "marked": done, "failed": fail,
@@ -462,14 +657,22 @@ def _exec_mark_read(user_id: str, action: dict) -> dict:
 
 
 def _exec_mark_all_read(user_id: str, action: dict) -> dict:
-    from api.controllers.emails.services import mark_all_inbox_read
+    from api.controllers.emails.services import bulk_update_emails
 
     mb = action.get("mailbox_id")
     if mb is not None and isinstance(mb, str) and not mb.strip():
         mb = None
-    result = mark_all_inbox_read(user_id, mailbox_id=mb)
-    marked = result.get("marked", 0)
-    failed = result.get("failed", 0)
+    ids = _resolve_email_ids(user_id, {
+        "folder": "inbox",
+        "read": False,
+        "mailbox_id": mb,
+        "limit": int(action.get("limit") or 0) or None,
+    })
+    if not ids:
+        return {"details": "No unread inbox emails found", "marked": 0, "failed": 0}
+    res = bulk_update_emails(user_id, ids, {"read": True})
+    marked = int(res.get("processed", 0) or 0)
+    failed = len(res.get("failed", []) or [])
     return {
         "details": f"Marked {marked} inbox email(s) as read" + (f" ({failed} failed)" if failed else ""),
         "marked": marked,
@@ -478,14 +681,22 @@ def _exec_mark_all_read(user_id: str, action: dict) -> dict:
 
 
 def _exec_mark_all_unread(user_id: str, action: dict) -> dict:
-    from api.controllers.emails.services import mark_all_inbox_unread
+    from api.controllers.emails.services import bulk_update_emails
 
     mb = action.get("mailbox_id")
     if mb is not None and isinstance(mb, str) and not mb.strip():
         mb = None
-    result = mark_all_inbox_unread(user_id, mailbox_id=mb)
-    marked = result.get("marked", 0)
-    failed = result.get("failed", 0)
+    ids = _resolve_email_ids(user_id, {
+        "folder": "inbox",
+        "read": True,
+        "mailbox_id": mb,
+        "limit": int(action.get("limit") or 0) or None,
+    })
+    if not ids:
+        return {"details": "No read inbox emails found", "marked": 0, "failed": 0}
+    res = bulk_update_emails(user_id, ids, {"read": False})
+    marked = int(res.get("processed", 0) or 0)
+    failed = len(res.get("failed", []) or [])
     return {
         "details": f"Marked {marked} inbox email(s) as unread" + (f" ({failed} failed)" if failed else ""),
         "marked": marked,
@@ -494,17 +705,14 @@ def _exec_mark_all_unread(user_id: str, action: dict) -> dict:
 
 
 def _exec_mark_unread(user_id: str, action: dict) -> dict:
-    from api.controllers.emails.services import update_email
+    from api.controllers.emails.services import bulk_update_emails
 
     ids = _resolve_email_ids(user_id, action)
     if not ids:
         raise ValueError("No matching emails found. Provide email_id, from_email, subject, or keywords.")
-    done, fail = 0, 0
-    for eid in ids:
-        if update_email(user_id, eid, {"read": False}):
-            done += 1
-        else:
-            fail += 1
+    res = bulk_update_emails(user_id, ids, {"read": False})
+    done = int(res.get("processed", 0) or 0)
+    fail = len(res.get("failed", []) or [])
     return {
         "details": f"Marked {done} email(s) as unread" + (f" ({fail} failed)" if fail else ""),
         "marked": done, "failed": fail,
@@ -512,7 +720,7 @@ def _exec_mark_unread(user_id: str, action: dict) -> dict:
 
 
 def _exec_snooze_email(user_id: str, action: dict) -> dict:
-    from api.controllers.emails.services import snooze_email
+    from api.controllers.emails.services import bulk_snooze_emails
 
     ids = _resolve_email_ids(user_id, action)
     if not ids:
@@ -520,12 +728,9 @@ def _exec_snooze_email(user_id: str, action: dict) -> dict:
     hours = int(action.get("hours", 24))
     if hours < 1:
         raise ValueError("hours must be >= 1 for snooze_email")
-    done, fail = 0, 0
-    for eid in ids:
-        if snooze_email(user_id, eid, hours):
-            done += 1
-        else:
-            fail += 1
+    res = bulk_snooze_emails(user_id, ids, hours)
+    done = int(res.get("processed", 0) or 0)
+    fail = len(res.get("failed", []) or [])
     return {
         "details": f"Snoozed {done} email(s) for {hours} hours" + (f" ({fail} failed)" if fail else ""),
         "marked": done, "failed": fail,
@@ -533,21 +738,8 @@ def _exec_snooze_email(user_id: str, action: dict) -> dict:
 
 
 def _exec_delete_email(user_id: str, action: dict) -> dict:
-    from api.controllers.emails.services import delete_email
-
-    ids = _resolve_email_ids(user_id, action)
-    if not ids:
-        raise ValueError("No matching emails found. Provide email_id, from_email, subject, or keywords.")
-    done, fail = 0, 0
-    for eid in ids:
-        if delete_email(user_id, eid):
-            done += 1
-        else:
-            fail += 1
-    return {
-        "details": f"Permanently deleted {done} email(s)" + (f" ({fail} failed)" if fail else ""),
-        "marked": done, "failed": fail,
-    }
+    """Natural-language 'delete' moves messages to trash (same as trash_email)."""
+    return _exec_trash_email(user_id, action)
 
 
 # Helpers
@@ -583,3 +775,24 @@ def _parse_iso_dt(value):
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+_DRAFT_FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$", re.MULTILINE)
+_DRAFT_PREAMBLE_RE = re.compile(
+    r"^(?:here(?:'s| is)?|sure|of\s+course|certainly|below\s+is|please\s+find)"
+    r"[^\n]*(?:draft|reply|response|email)[^\n]*[:.\-—]?\s*\n+",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_draft_body(text: str) -> str:
+    """Strip LLM scaffolding (markdown fences, 'Here is the draft:' preambles,
+    stray whitespace) from a drafted email body so the recipient never sees it."""
+    if not text:
+        return ""
+    cleaned = text.strip()
+    cleaned = _DRAFT_FENCE_RE.sub("", cleaned).strip()
+    cleaned = _DRAFT_PREAMBLE_RE.sub("", cleaned, count=1).strip()
+    if cleaned.startswith('"') and cleaned.endswith('"') and len(cleaned) > 2:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned

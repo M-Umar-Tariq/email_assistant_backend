@@ -798,15 +798,29 @@ def sync_mailbox(
                         except Exception as att_err:
                             print(f"[SYNC] Failed to store attachment binary for email '{email_data['email_id']}' index {att_bin['index']}: {att_err}")
 
+                    # Store detected meeting info on the email; do NOT auto-add to
+                    # the calendar. The user must explicitly approve each detected
+                    # meeting via the "Add to calendar" banner on the email.
                     mtg = meeting_by_email_id.get(email_data["email_id"])
                     if mtg:
                         try:
-                            from api.controllers.calendar.services import upsert_meeting_from_email
-                            upsert_meeting_from_email(
-                                user_id, email_data["email_id"], mtg, mailbox_id=mailbox_id
+                            email_metadata_col().update_one(
+                                {"_id": email_data["email_id"], "user_id": user_id},
+                                {
+                                    "$set": {
+                                        "detected_meeting": {
+                                            "title": mtg.get("title") or "Meeting",
+                                            "start": mtg.get("start"),
+                                            "end": mtg.get("end"),
+                                            "location": mtg.get("location"),
+                                            "attendees": mtg.get("attendees") or [],
+                                        },
+                                        "meeting_status": "pending",
+                                    }
+                                },
                             )
                         except Exception as mtg_err:
-                            print(f"[SYNC] Meeting upsert skipped: {mtg_err}")
+                            print(f"[SYNC] Meeting detection save skipped: {mtg_err}")
 
                     synced_count += 1
                 except Exception as email_err:
@@ -1480,6 +1494,211 @@ def trash_email_on_imap(user_id: str, mailbox_id: str, message_id: str) -> bool:
 
 def spam_email_on_imap(user_id: str, mailbox_id: str, message_id: str) -> bool:
     return _move_email_on_imap(user_id, mailbox_id, message_id, "[Gmail]/Spam|Spam|Junk|INBOX.Spam|INBOX.Junk|Junk Email")
+
+
+# ── Bulk IMAP helpers (one login per mailbox, many messages per action) ───
+#
+# Each of these opens ONE IMAP session per mailbox and performs every
+# requested change (flag set / folder move) for all message_ids in one or
+# two IMAP commands. This replaces the naive per-email
+# login+select+search+flag pattern which made bulk actions O(N) round-trips.
+
+
+_ARCHIVE_FOLDER_CANDIDATES = "[Gmail]/All Mail|Archive|All Mail|INBOX.Archive"
+_TRASH_FOLDER_CANDIDATES = "[Gmail]/Trash|Trash|INBOX.Trash|Deleted Items|Deleted"
+_SPAM_FOLDER_CANDIDATES = "[Gmail]/Spam|Spam|Junk|INBOX.Spam|INBOX.Junk|Junk Email"
+_INBOX_FOLDER_CANDIDATES = "INBOX|Inbox"
+
+
+def _collect_uids(client, message_ids: list[str]) -> list[int]:
+    """Resolve many message_ids to UIDs over an already-selected folder.
+
+    Uses the fast `uid-<N>` shortcut inline and only issues a HEADER
+    search for message_ids that don't follow the shortcut convention.
+    """
+    uids: list[int] = []
+    for mid in message_ids:
+        if not mid:
+            continue
+        try:
+            resolved = _find_uids(client, mid)
+        except Exception:
+            resolved = []
+        uids.extend(resolved)
+    seen: set[int] = set()
+    deduped: list[int] = []
+    for uid in uids:
+        try:
+            uid_int = int(uid)
+        except (TypeError, ValueError):
+            continue
+        if uid_int in seen:
+            continue
+        seen.add(uid_int)
+        deduped.append(uid_int)
+    return deduped
+
+
+def _resolve_move_target(client, dest_folder_candidates: str) -> str | None:
+    folders = [f[2] for f in client.list_folders()]
+    for candidate in dest_folder_candidates.split("|"):
+        candidate_lower = candidate.lower().strip()
+        for f in folders:
+            f_lower = f.lower()
+            if (f_lower == candidate_lower
+                    or f_lower.endswith("/" + candidate_lower)
+                    or f_lower.endswith("." + candidate_lower)):
+                return f
+    return None
+
+
+def bulk_set_flag_on_imap(
+    user_id: str,
+    mailbox_id: str,
+    message_ids: list[str],
+    flag: bytes,
+    add: bool,
+) -> int:
+    """Add or remove an IMAP flag (e.g. \\Seen, \\Flagged) for many messages
+    using a single login + one add_flags/remove_flags call.
+
+    Returns the count of UIDs that were flagged (best-effort).
+    """
+    if not message_ids:
+        return 0
+    mb = mailboxes_col().find_one({"_id": ObjectId(mailbox_id), "user_id": user_id})
+    if not mb:
+        return 0
+    try:
+        password = decrypt(mb["encrypted_password"])
+        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
+            client.login(mb["username"], password)
+            client.select_folder("INBOX")
+            uids = _collect_uids(client, message_ids)
+            if not uids:
+                return 0
+            if add:
+                client.add_flags(uids, [flag])
+            else:
+                client.remove_flags(uids, [flag])
+            return len(uids)
+    except Exception as e:
+        print(f"[IMAP BULK FLAG] Error: {e}")
+        return 0
+
+
+def bulk_move_on_imap(
+    user_id: str,
+    mailbox_id: str,
+    message_ids: list[str],
+    dest_folder_candidates: str,
+) -> int:
+    """Move many messages (by message_id) to the first matching destination
+    folder using a single IMAP session. Returns number of UIDs moved.
+    """
+    if not message_ids:
+        return 0
+    mb = mailboxes_col().find_one({"_id": ObjectId(mailbox_id), "user_id": user_id})
+    if not mb:
+        return 0
+    try:
+        password = decrypt(mb["encrypted_password"])
+        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
+            client.login(mb["username"], password)
+            client.select_folder("INBOX")
+            uids = _collect_uids(client, message_ids)
+            if not uids:
+                return 0
+            target = _resolve_move_target(client, dest_folder_candidates)
+            if not target:
+                print(f"[IMAP BULK MOVE] No matching folder for '{dest_folder_candidates}'")
+                return 0
+            client.move(uids, target)
+            return len(uids)
+    except Exception as e:
+        print(f"[IMAP BULK MOVE] Error: {e}")
+        traceback.print_exc()
+        return 0
+
+
+def bulk_archive_on_imap(user_id: str, mailbox_id: str, message_ids: list[str]) -> int:
+    return bulk_move_on_imap(user_id, mailbox_id, message_ids, _ARCHIVE_FOLDER_CANDIDATES)
+
+
+def bulk_trash_on_imap(user_id: str, mailbox_id: str, message_ids: list[str]) -> int:
+    return bulk_move_on_imap(user_id, mailbox_id, message_ids, _TRASH_FOLDER_CANDIDATES)
+
+
+def bulk_spam_on_imap(user_id: str, mailbox_id: str, message_ids: list[str]) -> int:
+    return bulk_move_on_imap(user_id, mailbox_id, message_ids, _SPAM_FOLDER_CANDIDATES)
+
+
+def move_to_inbox_on_imap(user_id: str, mailbox_id: str, message_id: str) -> bool:
+    return _move_email_on_imap(user_id, mailbox_id, message_id, _INBOX_FOLDER_CANDIDATES)
+
+
+def bulk_move_to_inbox_on_imap(user_id: str, mailbox_id: str, message_ids: list[str]) -> int:
+    return bulk_move_on_imap(user_id, mailbox_id, message_ids, _INBOX_FOLDER_CANDIDATES)
+
+
+_SENT_FOLDER_CANDIDATES = (
+    "[Gmail]/Sent Mail",
+    "[Google Mail]/Sent Mail",
+    "Sent Items",
+    "Sent",
+    "INBOX.Sent",
+    "Sent Messages",
+    "[Gmail]/Sent",
+)
+
+
+def _pick_sent_folder(folders: list[str]) -> str | None:
+    """Find the provider's "Sent" folder by matching common naming conventions."""
+    lower_map = {f.lower(): f for f in folders}
+
+    for candidate in _SENT_FOLDER_CANDIDATES:
+        if candidate.lower() in lower_map:
+            return lower_map[candidate.lower()]
+
+    for f_lower, f_real in lower_map.items():
+        if f_lower == "sent" or f_lower.endswith("/sent") or f_lower.endswith(".sent"):
+            return f_real
+        if f_lower.endswith("/sent mail") or f_lower.endswith(".sent mail"):
+            return f_real
+        if f_lower.endswith("/sent items") or f_lower.endswith(".sent items"):
+            return f_real
+    return None
+
+
+def append_sent_to_imap(user_id: str, mailbox_id: str, raw_msg_bytes: bytes) -> bool:
+    """Save an outgoing message into the mailbox's IMAP "Sent" folder.
+
+    SMTP only delivers the message — it does NOT push a copy back to the
+    sender's IMAP Sent folder. Without this APPEND, the sent email never
+    shows up in the user's Gmail/Outlook "Sent" view or in the original
+    conversation thread. Failures are logged but NOT raised so the overall
+    send flow still succeeds.
+    """
+    mb = mailboxes_col().find_one({"_id": ObjectId(mailbox_id), "user_id": user_id})
+    if not mb:
+        print(f"[IMAP SENT] Mailbox not found: {mailbox_id}")
+        return False
+    try:
+        password = decrypt(mb["encrypted_password"])
+        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
+            client.login(mb["username"], password)
+            folders = [f[2] for f in client.list_folders()]
+            target = _pick_sent_folder(folders)
+            if not target:
+                print(f"[IMAP SENT] No Sent folder found among {folders}")
+                return False
+            client.append(target, raw_msg_bytes, flags=[b"\\Seen"])
+            print(f"[IMAP SENT] Appended copy to '{target}'")
+            return True
+    except Exception as e:
+        print(f"[IMAP SENT] Error appending to Sent folder: {e}")
+        traceback.print_exc()
+        return False
 
 
 def _serialize(doc: dict) -> dict:
