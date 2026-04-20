@@ -230,6 +230,105 @@ def _resolve_single_email_id(user_id: str, action: dict) -> str:
     return ids[0] if ids else ""
 
 
+def _resolve_reply_email_id(user_id: str, action: dict) -> str:
+    """Stricter resolver for send_reply / reply_all.
+
+    To avoid replying to the wrong person, we refuse to resolve a reply purely
+    from fuzzy filters like keywords/subject. Acceptable targeting signals:
+      1. Exact ``email_id`` that exists.
+      2. ``email_ids`` (first valid entry).
+      3. ``from_email`` — latest email from that exact sender (optionally
+         narrowed by subject / keywords / date for disambiguation).
+
+    Returns "" when nothing matches, and raises ValueError when the caller
+    tried to target a reply by keywords alone.
+    """
+    raw_id = (action.get("email_id") or "").strip()
+    if raw_id:
+        col = email_metadata_col()
+        if col.find_one({"_id": raw_id, "user_id": user_id}, {"_id": 1}):
+            return raw_id
+        cleaned = raw_id.strip("`'\" ")
+        if cleaned and cleaned != raw_id and col.find_one(
+            {"_id": cleaned, "user_id": user_id}, {"_id": 1}
+        ):
+            return cleaned
+
+    ids_list = action.get("email_ids")
+    if isinstance(ids_list, list) and ids_list:
+        ids = _resolve_email_ids(user_id, {"email_ids": ids_list, "email_id": ""})
+        if ids:
+            return ids[0]
+
+    sender = (action.get("from_email") or "").strip()
+    if not sender:
+        raise ValueError(
+            "Cannot safely target a reply without email_id or from_email. "
+            "Please specify which email to reply to by its sender address or id."
+        )
+
+    # Sender is required; subject/keywords/date only narrow further.
+    narrowed = {
+        "from_email": sender,
+        "subject": action.get("subject", ""),
+        "keywords": action.get("keywords", ""),
+        "date_from": action.get("date_from"),
+        "date_to": action.get("date_to"),
+        "mailbox_id": action.get("mailbox_id"),
+        "email_id": "",
+    }
+    ids = _resolve_email_ids(user_id, narrowed)
+    return ids[0] if ids else ""
+
+
+def _normalize_addr(addr: str) -> str:
+    return (addr or "").strip().lower()
+
+
+def _guard_reply_recipient(
+    content: dict,
+    action: dict,
+    resolved_email_id: str,
+) -> str:
+    """Ensure the resolved email actually belongs to the intended sender and,
+    when the agent proposes a ``to`` override, that the override still points
+    at the original sender (plain reply semantics).
+
+    Returns the final, verified reply recipient (always the original sender).
+    Raises ValueError on any mismatch.
+    """
+    resolved_sender = _normalize_addr(content.get("from_email", ""))
+    if not resolved_sender:
+        raise ValueError(
+            "Cannot determine reply recipient — resolved email has no sender "
+            "address. Aborting to avoid sending to the wrong person."
+        )
+
+    claimed_sender = _normalize_addr(action.get("from_email", ""))
+    if claimed_sender and claimed_sender != resolved_sender:
+        raise ValueError(
+            f"Safety abort: the email resolved for this reply is from "
+            f"'{resolved_sender}', but the action requested '{claimed_sender}'. "
+            f"Refusing to send to prevent replying to the wrong person."
+        )
+
+    raw_to = action.get("to")
+    if isinstance(raw_to, str):
+        raw_to = [raw_to]
+    if isinstance(raw_to, list):
+        override = [_normalize_addr(t) for t in raw_to if t and str(t).strip()]
+        if override and resolved_sender not in override:
+            raise ValueError(
+                f"Safety abort: the reply 'to' override "
+                f"({', '.join(override)}) does not include the original "
+                f"sender '{resolved_sender}'. If you want to send a new "
+                f"message to a different recipient, use send_email instead "
+                f"of send_reply."
+            )
+
+    return content.get("from_email", "").strip()
+
+
 # Read / Open / Search
 
 
@@ -416,12 +515,14 @@ def _exec_draft_reply(user_id: str, action: dict) -> dict:
 def _exec_send_reply(user_id: str, action: dict) -> dict:
     from api.controllers.emails.services import reply_email as do_reply
 
-    email_id = _resolve_single_email_id(user_id, action)
+    email_id = _resolve_reply_email_id(user_id, action)
     content = get_email_content(email_id, user_id) if email_id else None
     if not content:
         raise ValueError(
-            "Email not found for reply. Provide email_id, from_email, subject, or keywords."
+            "Email not found for reply. Provide an exact email_id or from_email."
         )
+
+    verified_to = _guard_reply_recipient(content, action, email_id)
 
     body = (action.get("body") or "").strip()
     if not body:
@@ -448,7 +549,11 @@ def _exec_send_reply(user_id: str, action: dict) -> dict:
     body = _sanitize_draft_body(body)
 
     mailbox_id = action.get("mailbox_id") or _default_mailbox_id(user_id)
-    payload: dict = {"mailbox_id": mailbox_id, "body": body}
+    # Always reply to the resolved email's original sender. Any 'to' the
+    # agent proposed has already been validated by _guard_reply_recipient;
+    # we still pin the canonical address here to avoid subtle case / alias
+    # drift leaking into the envelope.
+    payload: dict = {"mailbox_id": mailbox_id, "body": body, "to": [verified_to]}
     if action.get("subject"):
         payload["subject"] = str(action["subject"]).strip()
     cc = action.get("cc")
@@ -456,25 +561,31 @@ def _exec_send_reply(user_id: str, action: dict) -> dict:
         cc = [cc]
     if isinstance(cc, list) and cc:
         payload["cc"] = [c.strip() for c in cc if c and str(c).strip()]
-    to_override = action.get("to")
-    if isinstance(to_override, str):
-        to_override = [to_override]
-    if isinstance(to_override, list) and to_override:
-        payload["to"] = [t.strip() for t in to_override if t and str(t).strip()]
 
     do_reply(user_id, email_id, payload)
-    to_addr = ", ".join(payload.get("to") or []) or content.get("from_email", "")
-    return {"details": f"Reply sent to {to_addr}"}
+    return {"details": f"Reply sent to {verified_to}"}
 
 
 def _exec_reply_all(user_id: str, action: dict) -> dict:
     from api.controllers.emails.services import reply_email as do_reply
 
-    email_id = _resolve_single_email_id(user_id, action)
+    email_id = _resolve_reply_email_id(user_id, action)
     content = get_email_content(email_id, user_id) if email_id else None
     if not content:
         raise ValueError(
-            "Email not found for reply_all. Provide email_id, from_email, subject, or keywords."
+            "Email not found for reply_all. Provide an exact email_id or from_email."
+        )
+
+    # Validate that the resolved email matches any claimed sender. The 'to'
+    # override check is intentionally skipped for reply_all (it expands the
+    # recipient list from the thread rather than targeting the sender only).
+    claimed_sender = _normalize_addr(action.get("from_email", ""))
+    resolved_sender = _normalize_addr(content.get("from_email", ""))
+    if claimed_sender and claimed_sender != resolved_sender:
+        raise ValueError(
+            f"Safety abort: the thread resolved for reply_all is from "
+            f"'{resolved_sender}', but the action requested '{claimed_sender}'. "
+            f"Refusing to send to avoid replying to the wrong thread."
         )
 
     mailbox_id = action.get("mailbox_id") or _default_mailbox_id(user_id)
