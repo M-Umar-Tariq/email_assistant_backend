@@ -417,10 +417,10 @@ def generate_speech(text: str) -> dict:
 
     client = OpenAI(api_key=django_settings.OPENAI_API_KEY)
     response = client.audio.speech.create(
-        model=getattr(django_settings, "OPENAI_TTS_MODEL", "tts-1-hd"),
+        model=getattr(django_settings, "OPENAI_TTS_MODEL", "tts-1"),
         voice=getattr(django_settings, "OPENAI_TTS_VOICE", "nova"),
         input=text[:4096],
-        speed=1.05,
+        speed=1.0,
     )
     audio_b64 = base64.b64encode(response.content).decode("utf-8")
     return {"audio": audio_b64, "format": "mp3"}

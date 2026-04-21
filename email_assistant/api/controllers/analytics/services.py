@@ -41,20 +41,23 @@ def get_volume(user_id: str, days: int = 7) -> list[dict]:
 
 
 def get_top_senders(user_id: str, limit: int = 10) -> list[dict]:
-    """Aggregate top senders from Qdrant (content store)."""
-    all_emails = scroll_all_chunk0(user_id)
-    counter: Counter = Counter()
-    name_map: dict[str, str] = {}
-    for email in all_emails:
-        addr = email.get("from_email", "")
-        if addr:
-            counter[addr] += 1
-            if not name_map.get(addr):
-                name_map[addr] = email.get("from_name", "")
-
+    """Aggregate top senders from inbox emails (excludes trashed and archived)."""
+    pipeline = [
+        {"$match": {"user_id": user_id, "trashed": False, "archived": False, "is_sent": {"$ne": True}}},
+        {"$group": {
+            "_id": "$from_email",
+            "count": {"$sum": 1},
+            "name": {"$first": "$from_name"},
+        }},
+        {"$match": {"_id": {"$ne": None}, "_id": {"$ne": ""}}},
+        {"$sort": {"count": -1}},
+        {"$limit": limit},
+    ]
+    results = list(email_metadata_col().aggregate(pipeline))
     return [
-        {"email": addr, "name": name_map.get(addr, ""), "count": count}
-        for addr, count in counter.most_common(limit)
+        {"email": r["_id"], "name": r.get("name", ""), "count": r["count"]}
+        for r in results
+        if r.get("_id")
     ]
 
 

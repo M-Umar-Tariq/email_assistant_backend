@@ -393,7 +393,16 @@ def sync_mailbox(
             batch_mids = [item[3] for item in raw_emails]
             existing_docs = list(email_metadata_col().find(
                 {"user_id": user_id, "mailbox_id": mailbox_id, "message_id": {"$in": batch_mids}},
-                {"message_id": 1, "read": 1, "starred": 1, "replied_at": 1, "date": 1, "imap_uid": 1, "reply_count": 1},
+                {
+                    "message_id": 1,
+                    "read": 1,
+                    "starred": 1,
+                    "replied_at": 1,
+                    "date": 1,
+                    "imap_uid": 1,
+                    "reply_count": 1,
+                    "thread_replies": {"$slice": 1},
+                },
             ))
             existing_map = {doc["message_id"]: doc for doc in existing_docs}
             # Also skip message_ids already stored as thread replies on another email
@@ -425,7 +434,8 @@ def sync_mailbox(
                     uid_i = int(uid)
                     if existing.get("imap_uid") != uid_i:
                         flag_updates["imap_uid"] = uid_i
-                    if existing.get("read") != is_read:
+                    # Thread-parent unread/read is owned by local thread logic.
+                    if not existing.get("thread_replies") and existing.get("read") != is_read:
                         flag_updates["read"] = is_read
                     if existing.get("starred") != is_starred:
                         flag_updates["starred"] = is_starred
@@ -1173,7 +1183,15 @@ def _refresh_tracked_imap_flags(
         "mailbox_id": mailbox_id,
         "imap_uid": {"$exists": True, "$ne": None},
     }
-    proj = {"imap_uid": 1, "read": 1, "starred": 1, "replied_at": 1, "date": 1, "reply_count": 1}
+    proj = {
+        "imap_uid": 1,
+        "read": 1,
+        "starred": 1,
+        "replied_at": 1,
+        "date": 1,
+        "reply_count": 1,
+        "thread_replies": {"$slice": 1},
+    }
     docs: list = []
     if last_raw:
         docs = list(
@@ -1221,7 +1239,10 @@ def _refresh_tracked_imap_flags(
             is_starred = b"\\Flagged" in flags
             is_replied = b"\\Answered" in flags
             flag_updates: dict = {}
-            if doc.get("read") != is_read:
+            # For thread-parent rows we manage unread/read locally based on
+            # incoming thread replies. If we always mirrored parent IMAP
+            # \\Seen here, a fresh reply could immediately flip back to read.
+            if not doc.get("thread_replies") and doc.get("read") != is_read:
                 flag_updates["read"] = is_read
             if doc.get("starred") != is_starred:
                 flag_updates["starred"] = is_starred

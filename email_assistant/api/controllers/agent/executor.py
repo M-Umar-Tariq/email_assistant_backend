@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 
 from database.db import mailboxes_col, follow_ups_col, email_metadata_col
-from api.utils.qdrant_helpers import get_email_content, get_email_ids_by_sender
+from api.utils.qdrant_helpers import get_email_content
 from api.utils.llm import chat
 
 
@@ -132,10 +132,6 @@ def _resolve_email_ids(user_id: str, action: dict) -> list[str]:
     except (TypeError, ValueError):
         limit_val = 0
 
-    candidate_ids: list[str] | None = None
-    if sender:
-        candidate_ids = get_email_ids_by_sender(user_id, sender, mb)
-
     query: dict = {"user_id": user_id}
     if folder == "trash":
         query.update({"trashed": True, "$or": [{"spam": {"$ne": True}}, {"spam": {"$exists": False}}]})
@@ -154,6 +150,9 @@ def _resolve_email_ids(user_id: str, action: dict) -> list[str]:
         query.update({"archived": False, "trashed": False})
     if mb:
         query["mailbox_id"] = mb
+
+    if sender:
+        query["from_email"] = {"$regex": f"^{re.escape(sender)}$", "$options": "i"}
 
     ands: list[dict] = []
     if subj:
@@ -180,14 +179,9 @@ def _resolve_email_ids(user_id: str, action: dict) -> list[str]:
             date_range["$lte"] = date_to
         query["date"] = date_range
 
-    if candidate_ids is not None:
-        if not candidate_ids:
-            return []
-        query["_id"] = {"$in": candidate_ids}
-
     # Require at least one targeting signal before returning bulk matches.
     has_filter = (
-        candidate_ids is not None
+        bool(sender)
         or bool(ands)
         or read_filter is not None
         or bool(label)

@@ -176,7 +176,7 @@ def folder_counts(user_id: str, mailbox_id: str | None = None) -> dict:
         base["mailbox_id"] = mailbox_id
     now = datetime.now(timezone.utc)
 
-    inbox_q = {**base, "archived": False, "trashed": False,
+    inbox_q = {**base, "archived": False, "trashed": False, "read": False,
                "$or": [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}]}
     sent_q = {**base, "is_sent": True}
     trash_q = {**base, "trashed": True, "$or": [{"spam": {"$ne": True}}, {"spam": {"$exists": False}}]}

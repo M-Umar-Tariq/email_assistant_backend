@@ -5,6 +5,7 @@ All immutable email content lives in Qdrant payloads.
 """
 
 import json
+import re
 
 from django.conf import settings
 from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
@@ -104,17 +105,33 @@ def scroll_all_chunk0(
     return [_payload_to_content(p.payload) for p in all_points]
 
 
+_ANGLE_ADDR_RE = re.compile(r"<([^>]+)>")
+
+
+def _extract_addr(addr: str) -> str:
+    """Return the bare email address from 'Name <addr>' or plain 'addr'."""
+    m = _ANGLE_ADDR_RE.search(addr or "")
+    return m.group(1).strip().lower() if m else (addr or "").strip().lower()
+
+
 def get_email_ids_by_sender(
     user_id: str,
     from_email: str,
     mailbox_id: str | None = None,
 ) -> list[str]:
-    """Return email_ids for inbox emails from the given sender (case-insensitive)."""
+    """Return email_ids for emails from the given sender (case-insensitive).
+
+    Handles both bare addresses and 'Name <addr>' format stored in Qdrant.
+    """
     if not (from_email or "").strip():
         return []
     all_content = scroll_all_chunk0(user_id, mailbox_id=mailbox_id)
-    target = from_email.strip().lower()
-    return [c["email_id"] for c in all_content if c.get("email_id") and (c.get("from_email") or "").strip().lower() == target]
+    target = _extract_addr(from_email)
+    return [
+        c["email_id"]
+        for c in all_content
+        if c.get("email_id") and _extract_addr(c.get("from_email") or "") == target
+    ]
 
 
 def _payload_to_content(payload: dict) -> dict:
