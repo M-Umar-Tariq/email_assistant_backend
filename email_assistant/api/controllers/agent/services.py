@@ -204,11 +204,12 @@ def _fetch_rag_context(
         if needs_rag:
             if want_latest and not sender_addrs:
                 # Use date-sorted MongoDB fetch so newest email is genuinely first.
-                # Vector search ranks by semantic similarity, not recency.
+                # Fetch 3x the limit so Qdrant content gaps don't cause
+                # the most recent emails to fall off the result list.
                 vector_future = pool.submit(
                     _fetch_emails_by_date,
                     user_id, None, None, mailbox_id,
-                    email_limit,
+                    email_limit * 3,
                 )
             else:
                 vector_future = pool.submit(

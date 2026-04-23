@@ -308,9 +308,26 @@ def _fetch_emails_by_date(
     for m in metas:
         eid = str(m["_id"])
         c = content_map.get(eid)
-        if c:
-            contents.append(c)
-            matched_metas.append(m)
+        if not c:
+            # Email is in MongoDB but not yet indexed in Qdrant (e.g. very recent).
+            # Build minimal content from MongoDB metadata so the LLM sees it.
+            date_val = m.get("date")
+            date_str = date_val.isoformat() if isinstance(date_val, datetime) else str(date_val or "")
+            c = {
+                "email_id": eid,
+                "subject": m.get("subject", ""),
+                "from_name": m.get("from_name", ""),
+                "from_email": m.get("from_email", ""),
+                "to": m.get("to", []),
+                "date": date_str,
+                "preview": m.get("preview", ""),
+                "has_attachment": bool(m.get("has_attachment", False)),
+                "priority": m.get("priority", "medium"),
+                "body_chunk": m.get("preview", ""),
+                "attachment_text": "",
+            }
+        contents.append(c)
+        matched_metas.append(m)
 
     return contents, matched_metas
 
