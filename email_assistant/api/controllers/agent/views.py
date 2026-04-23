@@ -1,9 +1,13 @@
+import json
+
+from django.http import StreamingHttpResponse, JsonResponse
+from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
 from rest_framework import status
 
-from api.middleware import jwt_required
+from api.middleware import jwt_required, decode_token
 from . import services
 
 
@@ -76,6 +80,49 @@ def speak(request):
             {"error": "Speech generation failed. Please try again."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+
+
+@csrf_exempt
+def chat_stream(request):
+    """Streaming chat endpoint — yields SSE events (token chunks then done)."""
+    if request.method != "POST":
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+    try:
+        payload = decode_token(auth_header.split(" ", 1)[1])
+        if payload.get("type") != "access":
+            return JsonResponse({"error": "Invalid token"}, status=401)
+        user_id = payload["user_id"]
+    except Exception:
+        return JsonResponse({"error": "Invalid token"}, status=401)
+
+    try:
+        data = json.loads(request.body)
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    message = data.get("message", "").strip()
+    if not message:
+        return JsonResponse({"error": "message is required"}, status=400)
+
+    history = data.get("history", [])
+    mailbox_id = data.get("mailbox_id") or None
+
+    def event_stream():
+        try:
+            for event in services.agent_chat_stream(user_id, message, history or None, mailbox_id):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Internal error'})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
+    response["Cache-Control"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"
+    return response
 
 
 @api_view(["POST"])

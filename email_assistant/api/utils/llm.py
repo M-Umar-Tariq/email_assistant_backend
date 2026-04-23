@@ -49,6 +49,21 @@ def chat_json(system_prompt: str, user_message: str, temperature: float = 0.7, m
     return json.loads(resp.choices[0].message.content or "{}")
 
 
+def chat_multi_stream(messages: list[dict], temperature: float = 0.7, max_tokens: int = 4096):
+    """Stream token chunks from a multi-turn conversation. Yields string deltas."""
+    stream = _client().chat.completions.create(
+        model=settings.OPENAI_CHAT_MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=True,
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+
+
 def chat_with_images(
     system_prompt: str,
     user_message: str,

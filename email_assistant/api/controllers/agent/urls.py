@@ -10,4 +10,5 @@ urlpatterns = [
     path("reject/<str:action_id>/", views.reject, name="agent-reject"),
     path("speak/", views.speak, name="agent-speak"),
     path("transcribe/", views.transcribe, name="agent-transcribe"),
+    path("chat/stream/", views.chat_stream, name="agent-chat-stream"),
 ]

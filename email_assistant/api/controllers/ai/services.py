@@ -379,9 +379,20 @@ def _fetch_emails_by_vector(
     top_ids = seen_ids if limit is None else seen_ids[:limit]
     content_map = get_emails_content_batch(top_ids, user_id)
 
+    # Single batch query instead of N find_one() calls — fixes N+1.
+    # Skip stale vector entries that no longer exist in MongoDB metadata
+    # (prevents AI from generating actions for already-deleted emails).
+    metas_by_id = {
+        str(m["_id"]): m
+        for m in email_metadata_col().find({"_id": {"$in": top_ids}, "user_id": user_id})
+    }
+
     contents = []
     metas = []
     for eid in top_ids:
+        meta = metas_by_id.get(eid)
+        if not meta:
+            continue
         c = content_map.get(eid)
         if not c:
             p = payload_map.get(eid, {})
@@ -398,11 +409,6 @@ def _fetch_emails_by_vector(
                 "priority": p.get("priority", "medium"),
                 "attachment_text": p.get("attachment_text", ""),
             }
-        meta = email_metadata_col().find_one({"_id": eid, "user_id": user_id})
-        # Skip stale vector entries that no longer exist in MongoDB metadata.
-        # This prevents AI from generating actions for already-deleted emails.
-        if not meta:
-            continue
         contents.append(c)
         metas.append(meta)
 

@@ -1,6 +1,8 @@
 import json
 import re
 import base64
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from django.conf import settings as django_settings
@@ -12,10 +14,12 @@ from database.db import (
 )
 from api.controllers.ai.services import (
     _fetch_emails_by_vector,
+    _fetch_emails_by_date,
+    _LATEST_EMAIL_PATTERN,
     _build_email_block_compact,
     _build_email_block_full,
 )
-from api.utils.llm import chat_multi, chat_json
+from api.utils.llm import chat_multi, chat_multi_stream, chat_json
 from api.utils.qdrant_helpers import (
     get_email_content,
     get_email_ids_by_sender,
@@ -59,6 +63,19 @@ def _classify_email_limit(message: str) -> int:
         return 10
 
 
+_BULK_RE = re.compile(
+    r"\b(all|every|bulk|inbox|overview|how many|count|summarize|summary)\b",
+    re.I,
+)
+
+
+def _voice_email_limit(message: str) -> int:
+    """Fast heuristic for voice — no LLM call, <1ms."""
+    if _BULK_RE.search(message):
+        return 10
+    return 6
+
+
 _EMAIL_RAG_PATTERN = re.compile(
     r"\b("
     r"email|emails|e-mail|inbox|mailbox|mailboxes|unread|draft|drafts|reply|replies|forward|"
@@ -70,7 +87,7 @@ _EMAIL_RAG_PATTERN = re.compile(
 
 
 def _agent_needs_email_rag(message: str) -> bool:
-    """Pure chit-chat skips embedding, Qdrant, Cohere rerank, and the limit-classifier LLM."""
+    """Pure chit-chat skips embedding, Qdrant, and Cohere rerank."""
     m = message.strip()
     if len(m) > 160:
         return True
@@ -148,31 +165,103 @@ def _fetch_emails_by_sender_addrs(
     return contents, metas
 
 
-def agent_chat(
+_AGENT_LATEST_RE = re.compile(
+    r"\b(latest|newest|most\s+recent|last|recent)\s+(email|mail|message)\b"
+    r"|\b(last|latest|newest)\s+email\b"
+    r"|\bwhat(?:'s| is)\s+my\s+latest\s+email\b"
+    r"|\b(naya|nayi|akhri|recent|new)\s+(email|mail)\b"
+    r"|\bnew(?:est)?\s+email\b",
+    re.I,
+)
+
+
+def _fetch_rag_context(
     user_id: str,
     message: str,
-    conversation_history: list | None = None,
-    mailbox_id: str | None = None,
-) -> dict:
-    profile = get_profile(user_id)
-
+    mailbox_id: str | None,
+    voice: bool = False,
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Run sender lookup and vector search in parallel."""
     sender_addrs = _extract_sender_emails(message)
-    sender_contents, sender_metas = _fetch_emails_by_sender_addrs(
-        user_id, sender_addrs, mailbox_id
-    )
+    needs_rag = _agent_needs_email_rag(message)
+    # Detect "latest/newest email" queries — must use date-sorted fetch, not vector search.
+    want_latest = bool(_AGENT_LATEST_RE.search(message) or _LATEST_EMAIL_PATTERN.search(message))
 
-    if _agent_needs_email_rag(message):
-        email_limit = _classify_email_limit(message)
-        contents, metas = _fetch_emails_by_vector(
-            user_id,
-            message,
-            mailbox_id=mailbox_id,
-            limit=email_limit,
-            search_chunk_limit=140,
-            rerank_cap=90,
-        )
+    # Voice: use fast heuristic (no extra LLM call, no blocking).
+    # Text: resolve limit before submitting so it runs concurrently with sender lookup.
+    if voice:
+        email_limit = _voice_email_limit(message)
     else:
-        contents, metas = [], []
+        email_limit = _classify_email_limit(message)
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sender_future = (
+            pool.submit(_fetch_emails_by_sender_addrs, user_id, sender_addrs, mailbox_id)
+            if sender_addrs else None
+        )
+
+        if needs_rag:
+            if want_latest and not sender_addrs:
+                # Use date-sorted MongoDB fetch so newest email is genuinely first.
+                # Vector search ranks by semantic similarity, not recency.
+                vector_future = pool.submit(
+                    _fetch_emails_by_date,
+                    user_id, None, None, mailbox_id,
+                    email_limit,
+                )
+            else:
+                vector_future = pool.submit(
+                    _fetch_emails_by_vector,
+                    user_id, message,
+                    mailbox_id=mailbox_id,
+                    limit=email_limit,
+                    # Voice: skip Cohere rerank (saves 200-500ms), smaller chunk pool.
+                    search_chunk_limit=60 if voice else 140,
+                    rerank_cap=0 if voice else 90,
+                )
+        else:
+            vector_future = None
+
+        sender_contents, sender_metas = sender_future.result() if sender_future else ([], [])
+        vector_contents, vector_metas = vector_future.result() if vector_future else ([], [])
+
+    elapsed = time.perf_counter() - t0
+    sender_count = len(sender_contents)
+    vector_count = len(vector_contents)
+    print(
+        f"  [RAG]  {elapsed:.2f}s — "
+        f"sender:{sender_count} emails  vector:{vector_count} emails"
+        f"  limit:{email_limit}{'  (skipped)' if not needs_rag and not sender_addrs else ''}",
+        flush=True,
+    )
+    return sender_contents, sender_metas, vector_contents, vector_metas
+
+
+def _build_agent_messages(
+    user_id: str,
+    message: str,
+    conversation_history: list | None,
+    mailbox_id: str | None,
+    voice: bool = False,
+) -> tuple[list[dict], int, list[dict]]:
+    """Build LLM message list, max_tokens, and sources. Shared by streaming and non-streaming paths."""
+    from api.controllers.settings.services import get_user_preferences_prompt
+
+    # Fan out all independent DB/RAG work in parallel. Previously these ran
+    # sequentially: profile → RAG → mailboxes → prefs. Now they overlap.
+    t_fanout = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        profile_f = pool.submit(get_profile, user_id)
+        mailboxes_f = pool.submit(lambda: list(mailboxes_col().find({"user_id": user_id})))
+        prefs_f = pool.submit(get_user_preferences_prompt, user_id)
+        rag_f = pool.submit(_fetch_rag_context, user_id, message, mailbox_id, voice)
+
+        profile = profile_f.result()
+        mbox_docs = mailboxes_f.result()
+        user_prefs = prefs_f.result()
+        sender_contents, sender_metas, contents, metas = rag_f.result()
+    print(f"  [FANOUT] {time.perf_counter() - t_fanout:.2f}s — profile+mailboxes+prefs+RAG in parallel", flush=True)
 
     if sender_contents:
         seen_ids = {c.get("email_id") for c in sender_contents if c.get("email_id")}
@@ -187,7 +276,6 @@ def agent_chat(
                     seen_ids.add(eid)
         contents, metas = merged_contents, merged_metas
 
-    mbox_docs = list(mailboxes_col().find({"user_id": user_id}))
     mailbox_info = [
         {"id": str(mb["_id"]), "email": mb["email"], "name": mb["name"]}
         for mb in mbox_docs
@@ -197,7 +285,8 @@ def agent_chat(
     sources: list[dict] = []
     if contents:
         blocks = []
-        use_compact = len(contents) > 10
+        # Voice always uses compact blocks — shorter prompt = faster TTFT.
+        use_compact = voice or len(contents) > 10
         for c, m in zip(contents, metas):
             blocks.append(
                 _build_email_block_compact(c, m)
@@ -208,116 +297,187 @@ def agent_chat(
                 "email_id": c.get("email_id", ""),
                 "subject": c.get("subject", ""),
             })
-        email_context = ("\n\n" if use_compact else "\n\n━━━━━━━━━━━━━━━━━━━━\n\n").join(blocks)
-
-    from api.controllers.settings.services import get_user_preferences_prompt
+        email_context = "\n\n".join(blocks) if use_compact else "\n\n━━━━━━━━━━━━━━━━━━━━\n\n".join(blocks)
 
     now_str = datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M UTC")
     profile_summary = _format_profile(profile)
-    user_prefs = get_user_preferences_prompt(user_id)
     prefs_block = f"\n{user_prefs}\n\n" if user_prefs else ""
 
     key_contacts = profile.get("key_contacts", [])
+    # Voice: trim to 5 contacts (smaller prompt). Text: full list.
     contacts_lookup = [
         {"name": c.get("name", ""), "email": c.get("email", "")}
-        for c in key_contacts
+        for c in key_contacts[:5 if voice else len(key_contacts)]
         if c.get("email")
     ]
 
-    system_prompt = (
-        f"You are a real-time VOICE assistant for email. Today is {now_str}.\n"
-        "Your responses are spoken aloud via text-to-speech, so write exactly how a "
-        "friendly human would TALK — short sentences, natural rhythm, no markdown, no "
-        "bullet points, no asterisks, no numbered lists. Use commas and periods for "
-        "natural pauses. Keep answers under 3 sentences when possible.\n\n"
-        "VOICE STYLE:\n"
-        "- Talk like a helpful colleague, warm and concise.\n"
-        "- Never use formatting: no **, no ##, no - lists, no numbered lists.\n"
-        "- Say things like \"You got an email from Ahmed about the project deadline\" "
-        "not \"1. **Ahmed** - Subject: Project Deadline\".\n"
-        "- For multiple emails, briefly mention the top 2-3 and offer to go deeper.\n"
-        "- Use contractions: \"you've\", \"there's\", \"I'll\".\n"
-        "- Use filler-free but natural phrasing. Don't say \"certainly\" or \"absolutely\".\n\n"
-        f"USER PROFILE:\n{profile_summary}\n\n"
-        + prefs_block +
-        f"MAILBOXES:\n{json.dumps(mailbox_info, default=str)}\n\n"
-        f"KEY CONTACTS:\n{json.dumps(contacts_lookup, default=str)}\n\n"
-        f"RELEVANT EMAILS:\n{email_context or 'None found.'}\n\n"
-        "ACTIONS — when needed, append a JSON block (the user won't see it, only the "
-        "spoken text before it). Each email in the context has an ID.\n"
-        "```actions\n"
-        '[{"type":"mark_read","from_email":"x@y.com","label":"Mark all from X as read",'
-        '"requires_approval":true}]\n'
-        "```\n"
-        "TARGETING: For one email use email_id. For bulk by sender use from_email. "
-        "You can also use subject, keywords, folder, mailbox_id, label_name, read, date_from/date_to "
-        "to match multiple emails. "
-        "Never list many individual email_ids — use a filter.\n\n"
-        "SENDER LOOKUPS: When the user references an email address (e.g. "
-        "'delete all emails from x@y.com'), the backend will exactly match "
-        "that address against the inbox. ALWAYS emit the action with "
-        "from_email set to the mentioned address — even if RELEVANT EMAILS "
-        "above doesn't obviously show a match. Do NOT reply 'I couldn't find "
-        "any emails from that sender' just because the shown context is short; "
-        "the executor searches the full mailbox, not just the shown context.\n\n"
-        "Types: read_emails, open_email, open_latest_email, search_emails, "
-        "send_email, draft_email, draft_reply, send_reply, reply_all, forward_email, "
-        "trash_email, move_to_trash, archive_email, delete_email, "
-        "mark_read, mark_unread (accept email_id OR filters for bulk), "
-        "mark_all_read (ALL inbox → read, no email_id), "
-        "mark_all_unread (ALL inbox → unread, no email_id), "
-        "snooze_email (email_id or filters + hours), "
-        "send_whatsapp (to, body), set_reminder (email_id, hours).\n"
-        "Always set requires_approval=true for EVERY action.\n\n"
-        "RULES:\n"
-        "1. VOICE FIRST: Every response must sound natural when spoken. No visual formatting.\n"
-        "2. BREVITY: 1-3 sentences for simple queries. Up to 5 for email summaries.\n"
-        "3. Speech input may have errors — infer names, emails, intent from context and KEY CONTACTS.\n"
-        "4. If multiple contacts share a name, ask the user to pick.\n"
-        "5. Before sending, confirm: from which mailbox, to whom, about what. Keep it spoken.\n"
-        "6. Respond in the same language the user speaks.\n"
-        "7. SCOPE: email assistant only. Gently redirect off-topic questions.\n"
-        "8. Use send_reply for replies, reply_all for reply-all, send_email for new messages.\n"
-        "9. REPLY SAFETY — critical, read carefully:\n"
-        "    - send_reply and reply_all ALWAYS go to the sender of the original email. "
-        "      You must identify the original email precisely.\n"
-        "    - ALWAYS include the exact email_id from RELEVANT EMAILS above when replying. "
-        "      Pick the ID that matches what the user is clearly talking about.\n"
-        "    - If no email_id is available, include from_email (the original sender's exact address).\n"
-        "    - NEVER target a reply with only keywords or subject — that risks replying to the wrong person.\n"
-        "    - DO NOT set a 'to' field on send_reply. The reply auto-targets the original sender. "
-        "      If the user actually wants to send a new message to a DIFFERENT person, use send_email instead.\n"
-        "    - Before emitting a send_reply, confirm in one short spoken sentence: whose email you're replying to "
-        "      and what you'll say, so the user can catch a wrong pick.\n"
-        "    - If the user's request is ambiguous about WHICH email (e.g. multiple emails from the same sender), "
-        "      ask a quick clarifying question before emitting the action.\n"
-        "10. For delete/trash/archive/mark-unread/snooze, use the matching action type. "
-        "delete_email and trash_email both mean move to trash, not permanent delete.\n"
-        "11. BULK READ vs UNREAD — do not confuse them:\n"
-        "    - User wants READ / clear unread / mark everything read → type mark_all_read.\n"
-        "    - User wants UNREAD / mark all as unread / make everything unread → type mark_all_unread.\n"
-        "12. For 'all from sender X', use from_email filter. For 'all inbox', use mark_all_read/mark_all_unread."
-    )
+    if voice:
+        system_prompt = (
+            f"You are a real-time voice email assistant. Today: {now_str}.\n"
+            "Spoken output — no markdown, no bullets, no lists, no asterisks. "
+            "Short sentences, contractions, under 3 sentences when possible. "
+            "Respond in the user's language.\n\n"
+            f"PROFILE: {profile_summary}\n"
+            + prefs_block +
+            f"MAILBOXES: {json.dumps(mailbox_info, default=str)}\n"
+            f"CONTACTS: {json.dumps(contacts_lookup, default=str)}\n\n"
+            "EMAILS (sorted newest first — the FIRST email listed IS the most recent/latest):\n"
+            "When the user asks for 'latest', 'newest', 'last', 'naya', 'akhri' email, "
+            "ALWAYS refer to the FIRST email in the list below.\n"
+            f"{email_context or 'None found.'}\n\n"
+            "ACTIONS — append a ```actions JSON block when acting. Always "
+            'requires_approval=true. Example: [{"type":"mark_read","from_email":"x@y.com",'
+            '"label":"Mark all from X","requires_approval":true}]\n'
+            "Types: read_emails, open_email, open_latest_email, search_emails, "
+            "send_email, draft_email, draft_reply, send_reply, reply_all, forward_email, "
+            "trash_email, archive_email, delete_email, mark_read, mark_unread, "
+            "mark_all_read, mark_all_unread, snooze_email, send_whatsapp, set_reminder.\n\n"
+            "TARGETING: single→email_id. bulk→from_email/subject/keywords/folder/label_name/"
+            "read/date_from/date_to. Never list many email_ids.\n"
+            "SENDER: if user names an email address, ALWAYS emit the action with that "
+            "from_email even if EMAILS above doesn't show a match — executor searches full inbox.\n"
+            "REPLY: send_reply/reply_all auto-target the original sender. ALWAYS include "
+            "email_id (or from_email) of the exact original email. Never target by keywords alone. "
+            "No 'to' field on replies. If ambiguous, ask first.\n"
+            "BULK: mark_all_read = everything→read. mark_all_unread = everything→unread. Don't confuse.\n"
+            "SCOPE: email only. Before sending, confirm mailbox+recipient+gist in one short spoken line."
+        )
+    else:
+        system_prompt = (
+            f"You are a real-time VOICE assistant for email. Today is {now_str}.\n"
+            "Your responses are spoken aloud via text-to-speech, so write exactly how a "
+            "friendly human would TALK — short sentences, natural rhythm, no markdown, no "
+            "bullet points, no asterisks, no numbered lists. Use commas and periods for "
+            "natural pauses. Keep answers under 3 sentences when possible.\n\n"
+            "VOICE STYLE:\n"
+            "- Talk like a helpful colleague, warm and concise.\n"
+            "- Never use formatting: no **, no ##, no - lists, no numbered lists.\n"
+            "- Say things like \"You got an email from Ahmed about the project deadline\" "
+            "not \"1. **Ahmed** - Subject: Project Deadline\".\n"
+            "- For multiple emails, briefly mention the top 2-3 and offer to go deeper.\n"
+            "- Use contractions: \"you've\", \"there's\", \"I'll\".\n"
+            "- Use filler-free but natural phrasing. Don't say \"certainly\" or \"absolutely\".\n\n"
+            f"USER PROFILE:\n{profile_summary}\n\n"
+            + prefs_block +
+            f"MAILBOXES:\n{json.dumps(mailbox_info, default=str)}\n\n"
+            f"KEY CONTACTS:\n{json.dumps(contacts_lookup, default=str)}\n\n"
+            f"RELEVANT EMAILS:\n{email_context or 'None found.'}\n\n"
+            "ACTIONS — when needed, append a JSON block (the user won't see it, only the "
+            "spoken text before it). Each email in the context has an ID.\n"
+            "```actions\n"
+            '[{"type":"mark_read","from_email":"x@y.com","label":"Mark all from X as read",'
+            '"requires_approval":true}]\n'
+            "```\n"
+            "TARGETING: For one email use email_id. For bulk by sender use from_email. "
+            "You can also use subject, keywords, folder, mailbox_id, label_name, read, date_from/date_to "
+            "to match multiple emails. "
+            "Never list many individual email_ids — use a filter.\n\n"
+            "SENDER LOOKUPS: When the user references an email address (e.g. "
+            "'delete all emails from x@y.com'), the backend will exactly match "
+            "that address against the inbox. ALWAYS emit the action with "
+            "from_email set to the mentioned address — even if RELEVANT EMAILS "
+            "above doesn't obviously show a match. Do NOT reply 'I couldn't find "
+            "any emails from that sender' just because the shown context is short; "
+            "the executor searches the full mailbox, not just the shown context.\n\n"
+            "Types: read_emails, open_email, open_latest_email, search_emails, "
+            "send_email, draft_email, draft_reply, send_reply, reply_all, forward_email, "
+            "trash_email, move_to_trash, archive_email, delete_email, "
+            "mark_read, mark_unread (accept email_id OR filters for bulk), "
+            "mark_all_read (ALL inbox → read, no email_id), "
+            "mark_all_unread (ALL inbox → unread, no email_id), "
+            "snooze_email (email_id or filters + hours), "
+            "send_whatsapp (to, body), set_reminder (email_id, hours).\n"
+            "Always set requires_approval=true for EVERY action.\n\n"
+            "RULES:\n"
+            "1. VOICE FIRST: Every response must sound natural when spoken. No visual formatting.\n"
+            "2. BREVITY: 1-3 sentences for simple queries. Up to 5 for email summaries.\n"
+            "3. Speech input may have errors — infer names, emails, intent from context and KEY CONTACTS.\n"
+            "4. If multiple contacts share a name, ask the user to pick.\n"
+            "5. Before sending, confirm: from which mailbox, to whom, about what. Keep it spoken.\n"
+            "6. Respond in the same language the user speaks.\n"
+            "7. SCOPE: email assistant only. Gently redirect off-topic questions.\n"
+            "8. Use send_reply for replies, reply_all for reply-all, send_email for new messages.\n"
+            "9. REPLY SAFETY — critical, read carefully:\n"
+            "    - send_reply and reply_all ALWAYS go to the sender of the original email. "
+            "      You must identify the original email precisely.\n"
+            "    - ALWAYS include the exact email_id from RELEVANT EMAILS above when replying. "
+            "      Pick the ID that matches what the user is clearly talking about.\n"
+            "    - If no email_id is available, include from_email (the original sender's exact address).\n"
+            "    - NEVER target a reply with only keywords or subject — that risks replying to the wrong person.\n"
+            "    - DO NOT set a 'to' field on send_reply. The reply auto-targets the original sender. "
+            "      If the user actually wants to send a new message to a DIFFERENT person, use send_email instead.\n"
+            "    - Before emitting a send_reply, confirm in one short spoken sentence: whose email you're replying to "
+            "      and what you'll say, so the user can catch a wrong pick.\n"
+            "    - If the user's request is ambiguous about WHICH email (e.g. multiple emails from the same sender), "
+            "      ask a quick clarifying question before emitting the action.\n"
+            "10. For delete/trash/archive/mark-unread/snooze, use the matching action type. "
+            "delete_email and trash_email both mean move to trash, not permanent delete.\n"
+            "11. BULK READ vs UNREAD — do not confuse them:\n"
+            "    - User wants READ / clear unread / mark everything read → type mark_all_read.\n"
+            "    - User wants UNREAD / mark all as unread / make everything unread → type mark_all_unread.\n"
+            "12. For 'all from sender X', use from_email filter. For 'all inbox', use mark_all_read/mark_all_unread."
+        )
 
-    messages = [{"role": "system", "content": system_prompt}]
-
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
     if conversation_history:
-        for m in conversation_history[-8:]:
+        # Voice: 4 turns of history (faster). Text: 8 turns (richer context).
+        history_window = 4 if voice else 8
+        for m in conversation_history[-history_window:]:
             messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
-
     messages.append({"role": "user", "content": message})
 
-    max_out = 800 if contents else 250
-    response_text = chat_multi(messages, temperature=0.6, max_tokens=max_out)
+    if voice:
+        max_out = 300 if contents else 150
+    else:
+        max_out = 800 if contents else 250
+    return messages, max_out, sources[:10]
 
+
+def agent_chat(
+    user_id: str,
+    message: str,
+    conversation_history: list | None = None,
+    mailbox_id: str | None = None,
+) -> dict:
+    messages, max_out, sources = _build_agent_messages(user_id, message, conversation_history, mailbox_id)
+    response_text = chat_multi(messages, temperature=0.6, max_tokens=max_out)
     actions = _extract_actions(response_text)
     clean_text = _clean_response(response_text)
+    return {"content": clean_text, "actions": actions, "sources": sources}
 
-    return {
-        "content": clean_text,
-        "actions": actions,
-        "sources": sources[:10],
-    }
+
+def agent_chat_stream(
+    user_id: str,
+    message: str,
+    conversation_history: list | None = None,
+    mailbox_id: str | None = None,
+):
+    """Generator that yields SSE event dicts: token chunks then a final done event."""
+    t_start = time.perf_counter()
+    messages, max_out, sources = _build_agent_messages(user_id, message, conversation_history, mailbox_id, voice=True)
+    t_rag_done = time.perf_counter()
+    print(f"  [PREP] {t_rag_done - t_start:.2f}s — profile+RAG+prompt build", flush=True)
+
+    full_response = ""
+    t_first_token = None
+    for token in chat_multi_stream(messages, temperature=0.6, max_tokens=max_out):
+        if t_first_token is None:
+            t_first_token = time.perf_counter()
+            print(f"  [TTFT] {t_first_token - t_rag_done:.2f}s — time to first LLM token", flush=True)
+        full_response += token
+        yield {"type": "token", "content": token}
+
+    t_llm_done = time.perf_counter()
+    print(
+        f"  [LLM]  {t_llm_done - (t_first_token or t_rag_done):.2f}s — stream duration  "
+        f"| {len(full_response)} chars total  "
+        f"| TOTAL {t_llm_done - t_start:.2f}s end-to-end",
+        flush=True,
+    )
+
+    actions = _extract_actions(full_response)
+    clean_text = _clean_response(full_response)
+    yield {"type": "done", "content": clean_text, "actions": actions, "sources": sources}
 
 
 # ── Proactive suggestions ────────────────────────────────────────────────────
@@ -442,6 +602,8 @@ def transcribe_audio(audio_file) -> dict:
             tmp.write(chunk)
         tmp_path = tmp.name
 
+    file_kb = os.path.getsize(tmp_path) / 1024
+    t0 = time.perf_counter()
     try:
         with open(tmp_path, "rb") as f:
             transcript = client.audio.transcriptions.create(
@@ -449,7 +611,13 @@ def transcribe_audio(audio_file) -> dict:
                 file=f,
                 language="en",
             )
-        return {"text": transcript.text.strip()}
+        elapsed = time.perf_counter() - t0
+        text = transcript.text.strip()
+        print(
+            f"  [STT]  {elapsed:.2f}s — Whisper  |  {file_kb:.1f} KB  |  \"{text[:60]}{'...' if len(text) > 60 else ''}\"",
+            flush=True,
+        )
+        return {"text": text}
     finally:
         os.unlink(tmp_path)
 
