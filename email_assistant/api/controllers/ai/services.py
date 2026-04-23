@@ -474,7 +474,11 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
                 limit=budget["limit"],
             )
 
-            if not contents and not broad and not want_latest:
+            # Only fall back to vector search when NO specific time range was
+            # requested. If the user asked about "today" / "this week" etc. and
+            # nothing was found, vector search would return emails from completely
+            # different dates — making the LLM give a contradictory answer.
+            if not contents and not time_label and not want_latest:
                 contents, metas = _fetch_emails_by_vector(
                     user_id, query, mailbox_id,
                     limit=budget["limit"],
@@ -490,6 +494,14 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
             )
 
         if not contents:
+            if time_label:
+                # No emails found in the requested period — return honest answer.
+                period = time_label.replace("_", " ")
+                return {
+                    "answer": f"You have no emails for {period}.",
+                    "sources": [],
+                    "actions": [],
+                }
             return {
                 "answer": "I couldn't find any relevant emails matching your query.",
                 "sources": [],
@@ -534,7 +546,14 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
             "you must use the first email in the list.\n"
         )
         if time_label:
-            range_note += f"\nNote: The user asked about '{time_label.replace('_', ' ')}'. All {len(contents)} emails in that range are provided below.\n"
+            period = time_label.replace("_", " ")
+            range_note += (
+                f"\nNote: The user asked about '{period}'. "
+                f"The {len(contents)} email(s) below are the ONLY ones found in that period. "
+                "NEVER claim emails exist outside this set. "
+                "If this list is empty or the dates shown do not match the period, "
+                "say so honestly — do NOT invent or assume emails exist.\n"
+            )
         if use_compact:
             range_note += (
                 f"\nThe first {min(FULL_CUTOFF, len(contents))} emails below have FULL content; "
@@ -643,6 +662,10 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
         "- mark_unread: mark as unread. Accepts email_id OR filters for bulk.\n"
         "- mark_all_read: mark ALL inbox emails as read. NO email_id needed. Optional: mailbox_id.\n"
         "- mark_all_unread: mark ALL inbox emails as unread. NO email_id needed. Optional: mailbox_id.\n"
+        "- star_email: star/favourite one email (email_id) or many (from_email/subject/keywords).\n"
+        "- unstar_email: remove star. Accepts email_id OR filters for bulk.\n"
+        "- mark_all_starred: star ALL inbox emails. NO email_id needed. Optional: mailbox_id.\n"
+        "- mark_all_unstarred: unstar ALL starred inbox emails. NO email_id needed. Optional: mailbox_id.\n"
         "- snooze_email: snooze. Accepts email_id OR filters for bulk + hours (default 24).\n"
         "- send_whatsapp: send WhatsApp. Params: to (phone REQUIRED), body (REQUIRED).\n"
         "- set_reminder: set reminder. Params: email_id, hours (default 24).\n\n"
@@ -655,6 +678,11 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
         "5. Use send_reply for replies, reply_all for reply-all, send_email for NEW messages.\n"
         "6. Use trash_email for delete/remove/trash. Use archive_email for archive.\n"
         "7. For ALL inbox read/unread with no sender filter use mark_all_read / mark_all_unread.\n"
+        "   For ALL inbox star → mark_all_starred (no email_id). For ALL inbox unstar → mark_all_unstarred (no email_id).\n"
+        "   CRITICAL: NEVER list individual email_ids for 'star all' or 'unstar all'. "
+        "The EMAIL CONTEXT only shows a preview — the inbox has far more emails than shown. "
+        "mark_all_starred / mark_all_unstarred will operate on the ENTIRE inbox, not just visible emails.\n"
+        "   NEVER say you cannot star emails — starring IS supported via star_email / mark_all_starred.\n"
         "8. RECIPIENT RESOLUTION: When the user says a name, look up email from KEY CONTACTS. "
         "If multiple match, list ALL and ask the user to pick.\n"
         "9. COMPOSE PREVIEW: For send_email / send_reply / reply_all / forward_email, the JSON "

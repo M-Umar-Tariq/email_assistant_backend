@@ -24,11 +24,14 @@ def mailbox_list_create(request):
 
     ser = MailboxCreateSerializer(data=request.data)
     if not ser.is_valid():
-        return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
+        first_error = next(iter(ser.errors.values()), ["Invalid data"])[0]
+        return Response({"error": str(first_error)}, status=status.HTTP_400_BAD_REQUEST)
     try:
         mb = services.create_mailbox(request.user_id, ser.validated_data)
     except ValueError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        return Response({"error": f"Connection failed: {e}"}, status=status.HTTP_400_BAD_REQUEST)
     return Response(mb, status=status.HTTP_201_CREATED)
 
 

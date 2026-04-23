@@ -442,6 +442,12 @@ def sync_mailbox(
                     if is_replied and not existing.get("replied_at"):
                         flag_updates["replied_at"] = existing.get("date", datetime.now(timezone.utc)).isoformat() if isinstance(existing.get("date"), datetime) else datetime.now(timezone.utc).isoformat()
                         flag_updates["reply_count"] = existing.get("reply_count", 0) + 1
+                    # Email is present in INBOX on the server — if our DB still
+                    # marks it as trashed or archived, that means the user moved
+                    # it back to inbox on the server side. Reflect that change.
+                    if existing.get("trashed") or existing.get("archived"):
+                        flag_updates["trashed"] = False
+                        flag_updates["archived"] = False
                     if flag_updates:
                         email_metadata_col().update_one({"_id": existing["_id"]}, {"$set": flag_updates})
                         flags_updated += 1
@@ -874,6 +880,22 @@ def sync_mailbox(
             except Exception:
                 traceback.print_exc()
 
+        # Detect emails deleted/moved on the server: their IMAP UID disappears
+        # from all_msg_ids. Mark them as trashed in MongoDB so the website
+        # reflects the server-side deletion without waiting for a full sync.
+        try:
+            flags_updated += _detect_server_deletions(user_id, mailbox_id, set(all_msg_ids))
+        except Exception:
+            traceback.print_exc()
+
+        # Detect emails the user moved from Trash/Archive back to INBOX on the
+        # server. Incremental sync misses these because the restored email gets
+        # a new INBOX UID that may be below the watermark.
+        try:
+            flags_updated += _detect_server_restores(user_id, mailbox_id)
+        except Exception:
+            traceback.print_exc()
+
         mailbox_sync_meta: dict = {}
         if uidvalidity is not None:
             mailbox_sync_meta["imap_uidvalidity"] = int(uidvalidity)
@@ -1147,6 +1169,113 @@ def stop_sync(user_id: str, mailbox_id: str) -> dict:
 def _is_sync_cancelled(mb_id) -> bool:
     doc = mailboxes_col().find_one({"_id": mb_id}, {"sync_status": 1})
     return doc.get("sync_status") == "cancelled" if doc else True
+
+
+def _detect_server_deletions(user_id: str, mailbox_id: str, all_inbox_uids: set) -> int:
+    """Mark locally-inbox emails as trashed when they no longer appear in IMAP INBOX.
+
+    When a user deletes or moves an email on the server (Gmail/Hostinger), its
+    IMAP UID disappears from the INBOX folder. We compare every MongoDB inbox
+    email's stored imap_uid against the full current INBOX UID set. Any email
+    whose UID is gone from INBOX is marked trashed on the website too.
+
+    Only emails with a stored imap_uid are checked — emails synced before UID
+    tracking was added are skipped (they will be caught next full sync).
+    """
+    if not all_inbox_uids:
+        return 0
+
+    inbox_docs = list(
+        email_metadata_col().find(
+            {
+                "user_id": user_id,
+                "mailbox_id": mailbox_id,
+                "trashed": False,
+                "archived": False,
+                "imap_uid": {"$exists": True, "$ne": None},
+            },
+            {"imap_uid": 1},
+        )
+    )
+    if not inbox_docs:
+        return 0
+
+    to_trash = []
+    for doc in inbox_docs:
+        try:
+            uid = int(doc["imap_uid"])
+        except (TypeError, ValueError):
+            continue
+        if uid not in all_inbox_uids:
+            to_trash.append(doc["_id"])
+
+    if not to_trash:
+        return 0
+
+    email_metadata_col().update_many(
+        {"_id": {"$in": to_trash}, "user_id": user_id},
+        {"$set": {"trashed": True}},
+    )
+    print(f"[SYNC DELETE] {len(to_trash)} email(s) trashed — no longer in server INBOX")
+    return len(to_trash)
+
+
+def _detect_server_restores(user_id: str, mailbox_id: str) -> int:
+    """Detect emails the user moved back to INBOX on the mail server but are
+    still marked trashed/archived in our database.
+
+    Incremental sync only fetches UIDs above the watermark. When an email is
+    moved from Trash → Inbox on the server it gets a new INBOX UID that may be
+    BELOW the watermark, so the main sync loop never sees it. This function
+    opens a fresh IMAP connection, searches INBOX by Message-ID for every
+    locally-trashed email, and untrashes any found there.
+    """
+    trashed_docs = list(
+        email_metadata_col()
+        .find(
+            {
+                "user_id": user_id,
+                "mailbox_id": mailbox_id,
+                "$or": [{"trashed": True}, {"archived": True}],
+                "spam": {"$ne": True},
+                "message_id": {"$exists": True, "$ne": ""},
+            },
+            {"message_id": 1},
+        )
+        .limit(150)
+    )
+    if not trashed_docs:
+        return 0
+
+    mb = mailboxes_col().find_one({"_id": ObjectId(mailbox_id), "user_id": user_id})
+    if not mb:
+        return 0
+
+    restored = 0
+    try:
+        password = decrypt(mb["encrypted_password"])
+        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
+            client.login(mb["username"], password)
+            client.select_folder("INBOX", readonly=True)
+            for doc in trashed_docs:
+                mid = (doc.get("message_id") or "").strip()
+                if not mid:
+                    continue
+                try:
+                    uids = client.search(["HEADER", "Message-ID", mid])
+                    if uids:
+                        email_metadata_col().update_one(
+                            {"_id": doc["_id"]},
+                            {"$set": {"trashed": False, "archived": False}},
+                        )
+                        restored += 1
+                        print(f"[SYNC RESTORE] Untrashed message_id={mid}")
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"[SYNC RESTORE] Error: {e}")
+
+    return restored
 
 
 def _refresh_tracked_imap_flags(
@@ -1464,8 +1593,33 @@ def set_email_starred_on_imap(user_id: str, mailbox_id: str, message_id: str, st
         return False
 
 
-def _move_email_on_imap(user_id: str, mailbox_id: str, message_id: str, dest_folder: str) -> bool:
-    """Move an email to a different IMAP folder (Archive, Trash, Spam, etc.)."""
+def _resolve_folder(folders: list[str], candidates: str) -> str | None:
+    """Return the first real folder name matching any of the pipe-separated candidates."""
+    for candidate in candidates.split("|"):
+        c_lower = candidate.lower().strip()
+        for f in folders:
+            f_lower = f.lower()
+            if (f_lower == c_lower
+                    or f_lower.endswith("/" + c_lower)
+                    or f_lower.endswith("." + c_lower)):
+                return f
+    return None
+
+
+def _move_email_on_imap(
+    user_id: str,
+    mailbox_id: str,
+    message_id: str,
+    dest_folder: str,
+    src_folder_candidates: str = "INBOX",
+) -> bool:
+    """Move an email to a different IMAP folder.
+
+    Searches through src_folder_candidates (pipe-separated) in order until the
+    email's UID is found, then moves it to the first matching dest_folder.
+    Previously this always used INBOX as the source, which broke untrash because
+    the email is already in Trash, not INBOX.
+    """
     mb = mailboxes_col().find_one({"_id": ObjectId(mailbox_id), "user_id": user_id})
     if not mb:
         print(f"[IMAP MOVE] Mailbox not found: {mailbox_id}")
@@ -1474,29 +1628,34 @@ def _move_email_on_imap(user_id: str, mailbox_id: str, message_id: str, dest_fol
         password = decrypt(mb["encrypted_password"])
         with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
             client.login(mb["username"], password)
-            client.select_folder("INBOX")
-            uids = _find_uids(client, message_id)
-            if not uids:
-                print(f"[IMAP MOVE] No UIDs found for message_id={message_id}")
-                return False
             folders = [f[2] for f in client.list_folders()]
-            print(f"[IMAP MOVE] Available folders: {folders}")
-            target = None
-            for candidate in dest_folder.split("|"):
-                candidate_lower = candidate.lower().strip()
-                for f in folders:
-                    f_lower = f.lower()
-                    if (f_lower == candidate_lower
-                            or f_lower.endswith("/" + candidate_lower)
-                            or f_lower.endswith("." + candidate_lower)):
-                        target = f
-                        break
-                if target:
-                    break
+
+            target = _resolve_folder(folders, dest_folder)
             if not target:
-                print(f"[IMAP MOVE] No matching folder for '{dest_folder}' among {folders}")
+                print(f"[IMAP MOVE] No matching dest folder for '{dest_folder}' among {folders}")
                 return False
-            print(f"[IMAP MOVE] Moving UIDs {uids} to '{target}'")
+
+            # Search through each source folder candidate until UIDs are found.
+            uids: list = []
+            src_found: str | None = None
+            for src_candidate in src_folder_candidates.split("|"):
+                src_folder = _resolve_folder(folders, src_candidate.strip())
+                if not src_folder:
+                    continue
+                try:
+                    client.select_folder(src_folder)
+                    uids = _find_uids(client, message_id)
+                    if uids:
+                        src_found = src_folder
+                        break
+                except Exception:
+                    continue
+
+            if not uids:
+                print(f"[IMAP MOVE] No UIDs found for message_id={message_id} in any source folder")
+                return False
+
+            print(f"[IMAP MOVE] Moving UIDs {uids} from '{src_found}' to '{target}'")
             client.move(uids, target)
             return True
     except Exception as e:
@@ -1613,9 +1772,13 @@ def bulk_move_on_imap(
     mailbox_id: str,
     message_ids: list[str],
     dest_folder_candidates: str,
+    src_folder_candidates: str = "INBOX",
 ) -> int:
-    """Move many messages (by message_id) to the first matching destination
-    folder using a single IMAP session. Returns number of UIDs moved.
+    """Move many messages to the first matching destination folder.
+
+    Searches src_folder_candidates (pipe-separated) in order to find messages
+    that may be spread across folders (e.g. Trash + Archive when untrashing).
+    Returns the total number of UIDs moved.
     """
     if not message_ids:
         return 0
@@ -1626,20 +1789,51 @@ def bulk_move_on_imap(
         password = decrypt(mb["encrypted_password"])
         with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
             client.login(mb["username"], password)
-            client.select_folder("INBOX")
-            uids = _collect_uids(client, message_ids)
-            if not uids:
-                return 0
-            target = _resolve_move_target(client, dest_folder_candidates)
+            folders = [f[2] for f in client.list_folders()]
+
+            target = _resolve_folder(folders, dest_folder_candidates)
             if not target:
-                print(f"[IMAP BULK MOVE] No matching folder for '{dest_folder_candidates}'")
+                print(f"[IMAP BULK MOVE] No matching dest folder for '{dest_folder_candidates}'")
                 return 0
-            client.move(uids, target)
-            return len(uids)
+
+            total_moved = 0
+            remaining = list(message_ids)
+            for src_candidate in src_folder_candidates.split("|"):
+                if not remaining:
+                    break
+                src_folder = _resolve_folder(folders, src_candidate.strip())
+                if not src_folder:
+                    continue
+                try:
+                    client.select_folder(src_folder)
+                    uids = _collect_uids(client, remaining)
+                    if not uids:
+                        continue
+                    client.move(uids, target)
+                    total_moved += len(uids)
+                    # Remove successfully moved message_ids from remaining
+                    moved_mids = set(
+                        mid for mid in remaining
+                        if _find_uids_in_list(mid, uids)
+                    )
+                    remaining = [m for m in remaining if m not in moved_mids]
+                except Exception as e:
+                    print(f"[IMAP BULK MOVE] Error in folder '{src_folder}': {e}")
+                    continue
+
+            return total_moved
     except Exception as e:
         print(f"[IMAP BULK MOVE] Error: {e}")
         traceback.print_exc()
         return 0
+
+
+def _find_uids_in_list(message_id: str, uids: list[int]) -> bool:
+    """Check if a message_id's shortcut UID is in the list (best-effort)."""
+    stripped = (message_id or "").strip("<>")
+    if stripped.startswith("uid-") and stripped[4:].isdigit():
+        return int(stripped[4:]) in uids
+    return False
 
 
 def bulk_archive_on_imap(user_id: str, mailbox_id: str, message_ids: list[str]) -> int:
@@ -1655,11 +1849,14 @@ def bulk_spam_on_imap(user_id: str, mailbox_id: str, message_ids: list[str]) -> 
 
 
 def move_to_inbox_on_imap(user_id: str, mailbox_id: str, message_id: str) -> bool:
-    return _move_email_on_imap(user_id, mailbox_id, message_id, _INBOX_FOLDER_CANDIDATES)
+    # Email may be in Trash, Archive, or Spam — search all before INBOX.
+    src = f"{_TRASH_FOLDER_CANDIDATES}|{_ARCHIVE_FOLDER_CANDIDATES}|{_SPAM_FOLDER_CANDIDATES}|INBOX"
+    return _move_email_on_imap(user_id, mailbox_id, message_id, _INBOX_FOLDER_CANDIDATES, src)
 
 
 def bulk_move_to_inbox_on_imap(user_id: str, mailbox_id: str, message_ids: list[str]) -> int:
-    return bulk_move_on_imap(user_id, mailbox_id, message_ids, _INBOX_FOLDER_CANDIDATES)
+    src = f"{_TRASH_FOLDER_CANDIDATES}|{_ARCHIVE_FOLDER_CANDIDATES}|{_SPAM_FOLDER_CANDIDATES}|INBOX"
+    return bulk_move_on_imap(user_id, mailbox_id, message_ids, _INBOX_FOLDER_CANDIDATES, src)
 
 
 _SENT_FOLDER_CANDIDATES = (

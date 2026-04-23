@@ -1,4 +1,5 @@
 import smtplib
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -450,10 +451,14 @@ def archive_email(user_id: str, email_id: str) -> bool:
         {"_id": email_id, "user_id": user_id}, {"$set": {"archived": True}}
     )
     if r.modified_count > 0:
-        mailbox_services.archive_email_on_imap(
-            user_id, meta["mailbox_id"], meta["message_id"]
-        )
+        _imap_bg(mailbox_services.archive_email_on_imap,
+                 user_id, meta["mailbox_id"], meta["message_id"])
     return r.modified_count > 0
+
+
+def _imap_bg(fn, *args) -> None:
+    """Run an IMAP side-effect in a daemon thread so it never blocks the HTTP response."""
+    threading.Thread(target=fn, args=args, daemon=True).start()
 
 
 def trash_email(user_id: str, email_id: str) -> bool:
@@ -464,9 +469,8 @@ def trash_email(user_id: str, email_id: str) -> bool:
         {"_id": email_id, "user_id": user_id}, {"$set": {"trashed": True}}
     )
     if r.modified_count > 0:
-        mailbox_services.trash_email_on_imap(
-            user_id, meta["mailbox_id"], meta["message_id"]
-        )
+        _imap_bg(mailbox_services.trash_email_on_imap,
+                 user_id, meta["mailbox_id"], meta["message_id"])
     return r.modified_count > 0
 
 
@@ -479,9 +483,8 @@ def move_email_to_inbox(user_id: str, email_id: str) -> bool:
         {"$set": {"trashed": False, "archived": False, "spam": False}},
     )
     if r.modified_count > 0:
-        mailbox_services.move_to_inbox_on_imap(
-            user_id, meta["mailbox_id"], meta["message_id"]
-        )
+        _imap_bg(mailbox_services.move_to_inbox_on_imap,
+                 user_id, meta["mailbox_id"], meta["message_id"])
     return r.modified_count > 0
 
 
@@ -493,9 +496,8 @@ def spam_email(user_id: str, email_id: str) -> bool:
         {"_id": email_id, "user_id": user_id}, {"$set": {"trashed": True, "spam": True}}
     )
     if r.modified_count > 0:
-        mailbox_services.spam_email_on_imap(
-            user_id, meta["mailbox_id"], meta["message_id"]
-        )
+        _imap_bg(mailbox_services.spam_email_on_imap,
+                 user_id, meta["mailbox_id"], meta["message_id"])
     return r.modified_count > 0
 
 
@@ -505,9 +507,8 @@ def delete_email(user_id: str, email_id: str) -> bool:
     if not meta:
         return False
 
-    mailbox_services.trash_email_on_imap(
-        user_id, meta["mailbox_id"], meta["message_id"]
-    )
+    _imap_bg(mailbox_services.trash_email_on_imap,
+             user_id, meta["mailbox_id"], meta["message_id"])
 
     email_metadata_col().delete_one({"_id": email_id, "user_id": user_id})
     email_attachments_col().delete_many({"email_id": email_id, "user_id": user_id})
@@ -614,7 +615,7 @@ def bulk_archive_emails(user_id: str, email_ids: list[str]) -> dict:
     )
     by_mailbox = _group_metas_by_mailbox(metas)
     for mb_id, mids in by_mailbox.items():
-        mailbox_services.bulk_archive_on_imap(user_id, mb_id, mids)
+        _imap_bg(mailbox_services.bulk_archive_on_imap, user_id, mb_id, mids)
     return {"processed": len(ids), "failed": failed}
 
 
@@ -629,7 +630,7 @@ def bulk_trash_emails(user_id: str, email_ids: list[str]) -> dict:
     )
     by_mailbox = _group_metas_by_mailbox(metas)
     for mb_id, mids in by_mailbox.items():
-        mailbox_services.bulk_trash_on_imap(user_id, mb_id, mids)
+        _imap_bg(mailbox_services.bulk_trash_on_imap, user_id, mb_id, mids)
     return {"processed": len(ids), "failed": failed}
 
 
@@ -644,7 +645,7 @@ def bulk_spam_emails(user_id: str, email_ids: list[str]) -> dict:
     )
     by_mailbox = _group_metas_by_mailbox(metas)
     for mb_id, mids in by_mailbox.items():
-        mailbox_services.bulk_spam_on_imap(user_id, mb_id, mids)
+        _imap_bg(mailbox_services.bulk_spam_on_imap, user_id, mb_id, mids)
     return {"processed": len(ids), "failed": failed}
 
 
@@ -659,7 +660,7 @@ def bulk_move_to_inbox_emails(user_id: str, email_ids: list[str]) -> dict:
     )
     by_mailbox = _group_metas_by_mailbox(metas)
     for mb_id, mids in by_mailbox.items():
-        mailbox_services.bulk_move_to_inbox_on_imap(user_id, mb_id, mids)
+        _imap_bg(mailbox_services.bulk_move_to_inbox_on_imap, user_id, mb_id, mids)
     return {"processed": len(ids), "failed": failed}
 
 
@@ -691,7 +692,7 @@ def bulk_delete_emails(user_id: str, email_ids: list[str]) -> dict:
 
     by_mailbox = _group_metas_by_mailbox(metas)
     for mb_id, mids in by_mailbox.items():
-        mailbox_services.bulk_trash_on_imap(user_id, mb_id, mids)
+        _imap_bg(mailbox_services.bulk_trash_on_imap, user_id, mb_id, mids)
 
     ids = [m["_id"] for m in metas]
     email_metadata_col().delete_many({"_id": {"$in": ids}, "user_id": user_id})

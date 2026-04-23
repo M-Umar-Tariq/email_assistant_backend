@@ -98,6 +98,16 @@ def feedback_col():
     return get_db()["feedback"]
 
 
+def scheduled_emails_col():
+    """Emails scheduled for future delivery."""
+    return get_db()["scheduled_emails"]
+
+
+def email_templates_col():
+    """User-saved email templates."""
+    return get_db()["email_templates"]
+
+
 # ── Qdrant ───────────────────────────────────────────────────────────────────
 
 @lru_cache(maxsize=1)

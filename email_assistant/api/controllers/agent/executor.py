@@ -36,6 +36,12 @@ def execute_action(user_id: str, action: dict) -> dict:
         "mark_all_read": _exec_mark_all_read,
         "mark_all_unread": _exec_mark_all_unread,
         "mark_unread": _exec_mark_unread,
+        "star_email": _exec_star_email,
+        "unstar_email": _exec_unstar_email,
+        "mark_starred": _exec_star_email,
+        "mark_unstarred": _exec_unstar_email,
+        "mark_all_starred": _exec_mark_all_starred,
+        "mark_all_unstarred": _exec_mark_all_unstarred,
         "snooze_email": _exec_snooze_email,
     }
     executor_fn = executors.get(action_type)
@@ -168,6 +174,18 @@ def _resolve_email_ids(user_id: str, action: dict) -> list[str]:
 
     if read_filter is not None:
         query["read"] = read_filter
+
+    starred_val = action.get("starred")
+    starred_filter: bool | None
+    if isinstance(starred_val, bool):
+        starred_filter = starred_val
+    elif isinstance(starred_val, str) and starred_val.strip().lower() in ("true", "false"):
+        starred_filter = starred_val.strip().lower() == "true"
+    else:
+        starred_filter = None
+    if starred_filter is not None:
+        query["starred"] = starred_filter
+
     if label:
         query["labels"] = label
 
@@ -184,6 +202,7 @@ def _resolve_email_ids(user_id: str, action: dict) -> list[str]:
         bool(sender)
         or bool(ands)
         or read_filter is not None
+        or starred_filter is not None
         or bool(label)
         or bool(folder)
         or date_from is not None
@@ -821,6 +840,81 @@ def _exec_mark_unread(user_id: str, action: dict) -> dict:
     return {
         "details": f"Marked {done} email(s) as unread" + (f" ({fail} failed)" if fail else ""),
         "marked": done, "failed": fail,
+    }
+
+
+def _exec_star_email(user_id: str, action: dict) -> dict:
+    from api.controllers.emails.services import bulk_update_emails
+
+    ids = _resolve_email_ids(user_id, action)
+    if not ids:
+        raise ValueError("No matching emails found. Provide email_id, from_email, subject, or keywords.")
+    res = bulk_update_emails(user_id, ids, {"starred": True})
+    done = int(res.get("processed", 0) or 0)
+    fail = len(res.get("failed", []) or [])
+    return {
+        "details": f"Starred {done} email(s)" + (f" ({fail} failed)" if fail else ""),
+        "marked": done, "failed": fail,
+    }
+
+
+def _exec_unstar_email(user_id: str, action: dict) -> dict:
+    from api.controllers.emails.services import bulk_update_emails
+
+    ids = _resolve_email_ids(user_id, action)
+    if not ids:
+        raise ValueError("No matching emails found. Provide email_id, from_email, subject, or keywords.")
+    res = bulk_update_emails(user_id, ids, {"starred": False})
+    done = int(res.get("processed", 0) or 0)
+    fail = len(res.get("failed", []) or [])
+    return {
+        "details": f"Unstarred {done} email(s)" + (f" ({fail} failed)" if fail else ""),
+        "marked": done, "failed": fail,
+    }
+
+
+def _exec_mark_all_starred(user_id: str, action: dict) -> dict:
+    from api.controllers.emails.services import bulk_update_emails
+
+    mb = action.get("mailbox_id")
+    if mb is not None and isinstance(mb, str) and not mb.strip():
+        mb = None
+    ids = _resolve_email_ids(user_id, {
+        "folder": "inbox",
+        "mailbox_id": mb,
+        "limit": int(action.get("limit") or 0) or None,
+    })
+    if not ids:
+        return {"details": "No inbox emails found", "marked": 0, "failed": 0}
+    res = bulk_update_emails(user_id, ids, {"starred": True})
+    marked = int(res.get("processed", 0) or 0)
+    failed = len(res.get("failed", []) or [])
+    return {
+        "details": f"Starred {marked} inbox email(s)" + (f" ({failed} failed)" if failed else ""),
+        "marked": marked, "failed": failed,
+    }
+
+
+def _exec_mark_all_unstarred(user_id: str, action: dict) -> dict:
+    from api.controllers.emails.services import bulk_update_emails
+
+    mb = action.get("mailbox_id")
+    if mb is not None and isinstance(mb, str) and not mb.strip():
+        mb = None
+    ids = _resolve_email_ids(user_id, {
+        "folder": "inbox",
+        "starred": True,
+        "mailbox_id": mb,
+        "limit": int(action.get("limit") or 0) or None,
+    })
+    if not ids:
+        return {"details": "No starred inbox emails found", "marked": 0, "failed": 0}
+    res = bulk_update_emails(user_id, ids, {"starred": False})
+    marked = int(res.get("processed", 0) or 0)
+    failed = len(res.get("failed", []) or [])
+    return {
+        "details": f"Unstarred {marked} inbox email(s)" + (f" ({failed} failed)" if failed else ""),
+        "marked": marked, "failed": failed,
     }
 
 
