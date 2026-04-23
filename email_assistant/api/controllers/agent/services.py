@@ -16,6 +16,7 @@ from api.controllers.ai.services import (
     _fetch_emails_by_vector,
     _fetch_emails_by_date,
     _LATEST_EMAIL_PATTERN,
+    _detect_time_range,
     _build_email_block_compact,
     _build_email_block_full,
 )
@@ -180,19 +181,30 @@ def _fetch_rag_context(
     message: str,
     mailbox_id: str | None,
     voice: bool = False,
+    time_label: str | None = None,
+    start_dt=None,
+    end_dt=None,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
-    """Run sender lookup and vector search in parallel."""
+    """Run sender lookup and date/vector search in parallel.
+
+    When a time range is detected (today, yesterday, this week …) we use
+    _fetch_emails_by_date instead of vector search — vector search ranks by
+    semantic similarity and completely ignores email dates, so "today's emails"
+    via vector search returns whatever is semantically close to the word
+    "today", not what was actually received today.
+    """
     sender_addrs = _extract_sender_emails(message)
     needs_rag = _agent_needs_email_rag(message)
-    # Detect "latest/newest email" queries — must use date-sorted fetch, not vector search.
     want_latest = bool(_AGENT_LATEST_RE.search(message) or _LATEST_EMAIL_PATTERN.search(message))
+    has_time_range = bool(time_label)
 
-    # Voice: use fast heuristic (no extra LLM call, no blocking).
-    # Text: resolve limit before submitting so it runs concurrently with sender lookup.
     if voice:
         email_limit = _voice_email_limit(message)
     else:
         email_limit = _classify_email_limit(message)
+
+    # For time-range queries, fetch more to surface all emails in that window.
+    fetch_limit = (email_limit * 3) if (has_time_range or want_latest) else email_limit
 
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -202,14 +214,20 @@ def _fetch_rag_context(
         )
 
         if needs_rag:
-            if want_latest and not sender_addrs:
-                # Use date-sorted MongoDB fetch so newest email is genuinely first.
-                # Fetch 3x the limit so Qdrant content gaps don't cause
-                # the most recent emails to fall off the result list.
+            if has_time_range and not sender_addrs:
+                # Date-range query: vector search ignores dates entirely.
+                # Use MongoDB date-sorted fetch filtered to the detected range.
+                vector_future = pool.submit(
+                    _fetch_emails_by_date,
+                    user_id, start_dt, end_dt, mailbox_id,
+                    fetch_limit,
+                )
+            elif want_latest and not sender_addrs:
+                # "Latest email" — always use date-sorted fetch, never vector search.
                 vector_future = pool.submit(
                     _fetch_emails_by_date,
                     user_id, None, None, mailbox_id,
-                    email_limit * 3,
+                    fetch_limit,
                 )
             else:
                 vector_future = pool.submit(
@@ -217,7 +235,6 @@ def _fetch_rag_context(
                     user_id, message,
                     mailbox_id=mailbox_id,
                     limit=email_limit,
-                    # Voice: skip Cohere rerank (saves 200-500ms), smaller chunk pool.
                     search_chunk_limit=60 if voice else 140,
                     rerank_cap=0 if voice else 90,
                 )
@@ -228,12 +245,11 @@ def _fetch_rag_context(
         vector_contents, vector_metas = vector_future.result() if vector_future else ([], [])
 
     elapsed = time.perf_counter() - t0
-    sender_count = len(sender_contents)
-    vector_count = len(vector_contents)
     print(
         f"  [RAG]  {elapsed:.2f}s — "
-        f"sender:{sender_count} emails  vector:{vector_count} emails"
-        f"  limit:{email_limit}{'  (skipped)' if not needs_rag and not sender_addrs else ''}",
+        f"sender:{len(sender_contents)} emails  vector:{len(vector_contents)} emails"
+        f"  limit:{email_limit}  mode:{'date('+time_label+')' if has_time_range else 'latest' if want_latest else 'vector'}"
+        f"{'  (skipped)' if not needs_rag and not sender_addrs else ''}",
         flush=True,
     )
     return sender_contents, sender_metas, vector_contents, vector_metas
@@ -249,14 +265,21 @@ def _build_agent_messages(
     """Build LLM message list, max_tokens, and sources. Shared by streaming and non-streaming paths."""
     from api.controllers.settings.services import get_user_preferences_prompt
 
-    # Fan out all independent DB/RAG work in parallel. Previously these ran
-    # sequentially: profile → RAG → mailboxes → prefs. Now they overlap.
+    # Detect time range before spawning RAG so the fetch uses the right date
+    # filter and the system prompt can mention the period to the LLM.
+    time_label, start_dt, end_dt = _detect_time_range(message)
+
+    # Fan out all independent DB/RAG work in parallel.
     t_fanout = time.perf_counter()
     with ThreadPoolExecutor(max_workers=4) as pool:
         profile_f = pool.submit(get_profile, user_id)
         mailboxes_f = pool.submit(lambda: list(mailboxes_col().find({"user_id": user_id})))
         prefs_f = pool.submit(get_user_preferences_prompt, user_id)
-        rag_f = pool.submit(_fetch_rag_context, user_id, message, mailbox_id, voice)
+        rag_f = pool.submit(
+            _fetch_rag_context,
+            user_id, message, mailbox_id, voice,
+            time_label, start_dt, end_dt,
+        )
 
         profile = profile_f.result()
         mbox_docs = mailboxes_f.result()
@@ -312,6 +335,18 @@ def _build_agent_messages(
         if c.get("email")
     ]
 
+    # Time-range note injected into both voice and non-voice system prompts.
+    if time_label:
+        period = time_label.replace("_", " ")
+        _time_note = (
+            f"TIME FILTER ACTIVE — The user asked about '{period}'. "
+            f"The {len(contents)} email(s) below are ALL emails found in that period. "
+            "Base your answer ONLY on these emails. "
+            "If the list is empty, say no emails were received in that period — do NOT invent emails.\n\n"
+        )
+    else:
+        _time_note = ""
+
     if voice:
         system_prompt = (
             f"You are a real-time voice email assistant. Today: {now_str}.\n"
@@ -322,6 +357,7 @@ def _build_agent_messages(
             + prefs_block +
             f"MAILBOXES: {json.dumps(mailbox_info, default=str)}\n"
             f"CONTACTS: {json.dumps(contacts_lookup, default=str)}\n\n"
+            + _time_note +
             "EMAILS (sorted newest first — the FIRST email listed IS the most recent/latest):\n"
             "When the user asks for 'latest', 'newest', 'last', 'naya', 'akhri' email, "
             "ALWAYS refer to the FIRST email in the list below.\n"
@@ -370,6 +406,7 @@ def _build_agent_messages(
             + prefs_block +
             f"MAILBOXES:\n{json.dumps(mailbox_info, default=str)}\n\n"
             f"KEY CONTACTS:\n{json.dumps(contacts_lookup, default=str)}\n\n"
+            + _time_note +
             f"RELEVANT EMAILS:\n{email_context or 'None found.'}\n\n"
             "ACTIONS — when needed, append a JSON block (the user won't see it, only the "
             "spoken text before it). Each email in the context has an ID.\n"
