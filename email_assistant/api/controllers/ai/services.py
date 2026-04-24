@@ -21,13 +21,15 @@ from api.utils.qdrant_helpers import get_email_content, get_emails_content_batch
 # ── Query analysis ────────────────────────────────────────────────────────────
 
 _TIME_PATTERNS = [
-    (r"\btoday\b|\bآج\b|\baaj\b", "today"),
+    (r"\btoday\b|\bآج\b|\baaj\b|\babhi\b|\bfil\s*waqt\b", "today"),
     (r"\byesterday\b|\bkal\b|\bگزشتہ\b", "yesterday"),
+    (r"\bparso\b|\bday\s+before\s+yesterday\b", "day_before_yesterday"),
     (r"\bthis\s+week\b|\bis\s+week\b|\bis\s+hafte\b", "this_week"),
     (r"\blast\s+week\b|\bpichle\s+hafte\b|\bguzishta\s+hafte\b", "last_week"),
     (r"\bthis\s+month\b|\bis\s+month\b|\bis\s+mahine\b|\bis\s+maheene\b", "this_month"),
     (r"\blast\s+month\b|\bpichle\s+month\b|\bpichle\s+mahine\b", "last_month"),
-    (r"\blast\s+(\d+)\s+days?\b", "last_n_days"),
+    (r"\blast\s+(\d+)\s+days?\b|\bpichle\s+(\d+)\s+din\b|\bguzishta\s+(\d+)\s+din\b", "last_n_days"),
+    (r"\blast\s+(\d+)\s+hours?\b|\bpichle\s+(\d+)\s+ghante?\b", "last_n_hours"),
     (r"\bthis\s+year\b|\bis\s+saal\b|\bis\s+year\b", "this_year"),
     (r"\ball\s+emails?\b|\bsari?\s+emails?\b|\bsab\s+emails?\b|\btamam\b", "all"),
 ]
@@ -74,6 +76,10 @@ def _detect_time_range(query: str, tz: ZoneInfo | None = None) -> tuple[str | No
             start = _local_midnight(now_local - timedelta(days=1))
             end = _local_midnight(now_local)
             return label, start, end
+        if label == "day_before_yesterday":
+            start = _local_midnight(now_local - timedelta(days=2))
+            end = _local_midnight(now_local - timedelta(days=1))
+            return label, start, end
         if label == "this_week":
             start = _local_midnight(now_local - timedelta(days=now_local.weekday()))
             return label, start, now_utc
@@ -90,8 +96,12 @@ def _detect_time_range(query: str, tz: ZoneInfo | None = None) -> tuple[str | No
             start = _local_midnight(last_month_end.astimezone(tz if tz else timezone.utc).replace(day=1))
             return label, start, first_this
         if label == "last_n_days":
-            days = int(m.group(1))
-            start = _local_midnight(now_local - timedelta(days=days))
+            n = int(next(g for g in m.groups() if g is not None))
+            start = _local_midnight(now_local - timedelta(days=n))
+            return label, start, now_utc
+        if label == "last_n_hours":
+            n = int(next(g for g in m.groups() if g is not None))
+            start = now_utc - timedelta(hours=n)
             return label, start, now_utc
         if label == "this_year":
             start = _local_midnight(now_local.replace(month=1, day=1))
@@ -201,6 +211,50 @@ def _format_date(meta: dict | None, content: dict, tz: ZoneInfo | None = None) -
     return "unknown"
 
 
+def _build_thread_context(meta: dict) -> str:
+    """Build a chronological conversation thread from thread_replies and sent_replies."""
+    thread_replies = meta.get("thread_replies") or []
+    sent_replies = meta.get("sent_replies") or []
+    if not thread_replies and not sent_replies:
+        return ""
+
+    messages = []
+    for r in thread_replies:
+        messages.append({
+            "direction": "received",
+            "from_name": r.get("from_name", ""),
+            "from_email": r.get("from_email", ""),
+            "date": r.get("date", ""),
+            "body": r.get("body", ""),
+        })
+    for r in sent_replies:
+        to_list = r.get("to", [])
+        to_str = ", ".join(t.get("email", "") if isinstance(t, dict) else str(t) for t in to_list) if to_list else ""
+        messages.append({
+            "direction": "sent",
+            "from_email": r.get("from_email", ""),
+            "to": to_str,
+            "date": r.get("date", ""),
+            "body": r.get("body", ""),
+        })
+
+    messages.sort(key=lambda m: str(m.get("date", "")))
+
+    lines = ["\n--- CONVERSATION THREAD ---"]
+    for msg in messages:
+        if msg["direction"] == "received":
+            lines.append(
+                f"\n[Reply from {msg['from_name']} <{msg['from_email']}> on {msg['date']}]\n"
+                + (msg["body"][:1500] if len(msg["body"]) > 1500 else msg["body"])
+            )
+        else:
+            lines.append(
+                f"\n[Sent by you to {msg['to']} on {msg['date']}]\n"
+                + (msg["body"][:1500] if len(msg["body"]) > 1500 else msg["body"])
+            )
+    return "\n".join(lines)
+
+
 def _build_email_block_full(content: dict, meta: dict | None, tz: ZoneInfo | None = None) -> str:
     """Rich context block for a single email — used when we have few emails."""
     email_id = content.get("email_id", "")
@@ -241,6 +295,11 @@ def _build_email_block_full(content: dict, meta: dict | None, tz: ZoneInfo | Non
     if att_text:
         parts.append(f"\n[Attachment content]\n{att_text[:2000]}")
 
+    if meta:
+        thread_parts = _build_thread_context(meta)
+        if thread_parts:
+            parts.append(thread_parts)
+
     return "\n".join(parts)
 
 
@@ -276,9 +335,12 @@ def _fetch_emails_by_date(
     end: datetime | None,
     mailbox_id: str | None = None,
     limit: int = 0,
+    read_filter: bool | None = None,
+    starred_filter: bool | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Fetch emails from MongoDB by date range, then load content from Qdrant.
-    Returns (contents, metas) sorted by date descending. limit=0 means no limit."""
+    Returns (contents, metas) sorted by date descending. limit=0 means no limit.
+    Optional read_filter / starred_filter narrow results further."""
     query_filter: dict = {"user_id": user_id, "archived": {"$ne": True}, "trashed": {"$ne": True}}
     if start or end:
         date_filter = {}
@@ -292,6 +354,10 @@ def _fetch_emails_by_date(
         ]
     if mailbox_id:
         query_filter["mailbox_id"] = mailbox_id
+    if read_filter is not None:
+        query_filter["read"] = read_filter
+    if starred_filter is not None:
+        query_filter["starred"] = starred_filter
 
     cursor = email_metadata_col().find(query_filter).sort("date", -1)
     if limit > 0:
@@ -789,6 +855,10 @@ def ask_about_email(user_id: str, email_id: str, query: str) -> dict:
 
     if attachment_text:
         email_context += f"\n\n--- ATTACHMENT CONTENT ---\n{attachment_text[:8000]}"
+
+    thread_ctx = _build_thread_context(meta)
+    if thread_ctx:
+        email_context += f"\n\n{thread_ctx}"
 
     system_prompt = (
         "You are an AI email assistant. The user is reading a specific email "

@@ -2,8 +2,9 @@ from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 import json
 
+from pymongo import UpdateOne
 from database.db import follow_ups_col, email_metadata_col
-from api.utils.qdrant_helpers import get_email_content
+from api.utils.qdrant_helpers import get_email_content, get_emails_content_batch
 from api.utils.llm import chat_json
 
 
@@ -27,24 +28,35 @@ def list_follow_ups(user_id: str, status_filter: str | None = None) -> list[dict
     query: dict = {"user_id": user_id}
     if status_filter and status_filter != "all":
         query["status"] = status_filter
-    cursor = follow_ups_col().find(query).sort("due_date", 1)
+    docs = list(follow_ups_col().find(query).sort("due_date", 1))
+    if not docs:
+        return []
+
     now = datetime.now(timezone.utc)
+
+    # Detect overdue in memory and batch-update MongoDB in one round-trip
+    bulk_ops = []
+    for doc in docs:
+        if doc.get("status") not in ("completed", "snoozed"):
+            due = doc.get("due_date")
+            if isinstance(due, datetime) and due < now:
+                days_waiting = max((now - due).days, 1)
+                doc["status"] = "overdue"
+                doc["days_waiting"] = days_waiting
+                bulk_ops.append(UpdateOne(
+                    {"_id": doc["_id"]},
+                    {"$set": {"status": "overdue", "days_waiting": days_waiting, "updated_at": now}},
+                ))
+    if bulk_ops:
+        follow_ups_col().bulk_write(bulk_ops, ordered=False)
+
+    # Batch-fetch all email content from Qdrant in one shot
+    email_ids = [doc["email_id"] for doc in docs]
+    content_map = get_emails_content_batch(email_ids, user_id)
+
     results = []
-    for doc in cursor:
-        try:
-            if doc.get("status") not in ("completed", "snoozed"):
-                due = doc.get("due_date")
-                if isinstance(due, datetime) and due < now:
-                    days_waiting = max((now - due).days, 1)
-                    follow_ups_col().update_one(
-                        {"_id": doc["_id"]},
-                        {"$set": {"status": "overdue", "days_waiting": days_waiting, "updated_at": now}},
-                    )
-                    doc["status"] = "overdue"
-                    doc["days_waiting"] = days_waiting
-        except Exception:
-            pass
-        content = get_email_content(doc["email_id"], user_id)
+    for doc in docs:
+        content = content_map.get(doc["email_id"])
         # Skip orphan follow-ups (email was deleted e.g. when mailbox was removed)
         if not content:
             continue
@@ -87,10 +99,12 @@ def auto_detect_today_follow_ups(user_id: str) -> dict:
         {"$or": [{"snoozed_until": None}, {"snoozed_until": {"$lte": now}}]},
     ]}
     docs = list(email_metadata_col().find(q).limit(200))
+    email_ids = [str(d["_id"]) for d in docs]
+    content_map = get_emails_content_batch(email_ids, user_id) if email_ids else {}
     items: list[dict] = []
     for d in docs:
         eid = str(d["_id"])
-        content = get_email_content(eid, user_id) or {}
+        content = content_map.get(eid) or {}
         items.append({
             "id": eid,
             "subject": content.get("subject", ""),

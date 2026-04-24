@@ -2,10 +2,46 @@ import json
 import re
 import base64
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from django.conf import settings as django_settings
+
+
+# ── In-memory cache for profile / mailboxes / preferences ────────────────────
+#
+# Voice requests hit MongoDB 3× per turn (profile, mailboxes, prefs) even though
+# these rarely change mid-session. Small TTL cache saves ~200-400ms per request.
+
+_CACHE: dict = {}
+_TTL_PROFILE = 60
+_TTL_MAILBOXES = 30
+_TTL_PREFS = 60
+
+
+def _cached(key: str, ttl: int, fn):
+    now = time.time()
+    entry = _CACHE.get(key)
+    if entry and (now - entry["ts"]) < ttl:
+        return entry["val"]
+    val = fn()
+    _CACHE[key] = {"val": val, "ts": now}
+    return val
+
+
+def invalidate_user_cache(user_id: str) -> None:
+    """Call from profile/mailbox/settings update endpoints to drop stale cache."""
+    for k in list(_CACHE.keys()):
+        if k.endswith(f":{user_id}"):
+            _CACHE.pop(k, None)
+
+
+# Voice-specific LLM model (smaller/faster than the default chat model).
+_VOICE_MODEL = getattr(django_settings, "OPENAI_VOICE_MODEL", "gpt-4o-mini")
+
+# Sentence boundary for streaming TTS.
+_SENTENCE_END_RE = re.compile(r"[.!?][\s\"')\]]*(?=\s|$)")
 
 from database.db import (
     email_metadata_col,
@@ -175,6 +211,28 @@ _AGENT_LATEST_RE = re.compile(
     re.I,
 )
 
+_UNREAD_RE = re.compile(
+    r"\b(unread|unseen|na\s*parhi?|unread\s*emails?|unread\s*messages?)\b",
+    re.I,
+)
+
+_STARRED_RE = re.compile(
+    r"\b(starred|favourite[ds]?|bookmarked|flagged)\s*(emails?|messages?)?\b",
+    re.I,
+)
+
+_BROAD_INBOX_RE = re.compile(
+    r"\b(inbox|overview|briefing|digest|summary|summarize|recap)\b",
+    re.I,
+)
+
+# Explicit topic/content search — vector search is correct here even for voice.
+_TOPIC_SEARCH_RE = re.compile(
+    r"\b(find|search|look\s+for|dhundho?|about|related\s+to|concerning|"
+    r"regarding|mentioning|containing|with\s+subject|baray\s+mein)\b",
+    re.I,
+)
+
 
 def _fetch_rag_context(
     user_id: str,
@@ -197,14 +255,38 @@ def _fetch_rag_context(
     needs_rag = _agent_needs_email_rag(message)
     want_latest = bool(_AGENT_LATEST_RE.search(message) or _LATEST_EMAIL_PATTERN.search(message))
     has_time_range = bool(time_label)
+    want_unread = bool(_UNREAD_RE.search(message)) and not has_time_range
+    want_starred = bool(_STARRED_RE.search(message)) and not has_time_range
+    # Broad inbox overview without time filter → use date-sorted recent emails
+    want_broad = (
+        bool(_BROAD_INBOX_RE.search(message))
+        and not has_time_range
+        and not want_latest
+        and not want_unread
+        and not want_starred
+        and not sender_addrs
+    )
 
     if voice:
         email_limit = _voice_email_limit(message)
     else:
         email_limit = _classify_email_limit(message)
 
-    # For time-range queries, fetch more to surface all emails in that window.
     fetch_limit = (email_limit * 3) if (has_time_range or want_latest) else email_limit
+
+    # Decide retrieval mode (logged for debugging).
+    if has_time_range:
+        _mode = f"date({time_label})"
+    elif want_latest:
+        _mode = "latest"
+    elif want_unread:
+        _mode = "unread_filter"
+    elif want_starred:
+        _mode = "starred_filter"
+    elif want_broad:
+        _mode = "broad_inbox"
+    else:
+        _mode = "vector"
 
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -214,21 +296,51 @@ def _fetch_rag_context(
         )
 
         if needs_rag:
-            if has_time_range and not sender_addrs:
-                # Date-range query: vector search ignores dates entirely.
-                # Use MongoDB date-sorted fetch filtered to the detected range.
+            if has_time_range:
+                # Date-range query — applies even when a sender is also mentioned.
+                # Sender results come from sender_future; date fetch gives the
+                # time-filtered view for the LLM context.
                 vector_future = pool.submit(
                     _fetch_emails_by_date,
-                    user_id, start_dt, end_dt, mailbox_id,
-                    fetch_limit,
+                    user_id, start_dt, end_dt, mailbox_id, fetch_limit,
                 )
             elif want_latest and not sender_addrs:
-                # "Latest email" — always use date-sorted fetch, never vector search.
                 vector_future = pool.submit(
                     _fetch_emails_by_date,
-                    user_id, None, None, mailbox_id,
-                    fetch_limit,
+                    user_id, None, None, mailbox_id, fetch_limit,
                 )
+            elif want_unread and not sender_addrs:
+                # "Unread emails" — must filter by read=False, not semantic search.
+                vector_future = pool.submit(
+                    _fetch_emails_by_date,
+                    user_id, None, None, mailbox_id, email_limit,
+                    False,   # read_filter=False
+                    None,    # starred_filter
+                )
+            elif want_starred and not sender_addrs:
+                # "Starred emails" — must filter by starred=True.
+                vector_future = pool.submit(
+                    _fetch_emails_by_date,
+                    user_id, None, None, mailbox_id, email_limit,
+                    None,    # read_filter
+                    True,    # starred_filter=True
+                )
+            elif want_broad:
+                # Inbox overview without time range — date-sorted recent emails.
+                vector_future = pool.submit(
+                    _fetch_emails_by_date,
+                    user_id, None, None, mailbox_id, email_limit,
+                )
+            elif voice and not _TOPIC_SEARCH_RE.search(message):
+                # Voice fallback: regex didn't identify a specific pattern.
+                # Date-sorted recent emails are safer than vector search for voice
+                # because vector search ignores recency and can return stale emails.
+                # Exception: explicit topic/content searches still use vector search.
+                vector_future = pool.submit(
+                    _fetch_emails_by_date,
+                    user_id, None, None, mailbox_id, email_limit,
+                )
+                _mode = "voice_safe_fallback"
             else:
                 vector_future = pool.submit(
                     _fetch_emails_by_vector,
@@ -247,8 +359,8 @@ def _fetch_rag_context(
     elapsed = time.perf_counter() - t0
     print(
         f"  [RAG]  {elapsed:.2f}s — "
-        f"sender:{len(sender_contents)} emails  vector:{len(vector_contents)} emails"
-        f"  limit:{email_limit}  mode:{'date('+time_label+')' if has_time_range else 'latest' if want_latest else 'vector'}"
+        f"sender:{len(sender_contents)}  vector:{len(vector_contents)}"
+        f"  limit:{email_limit}  mode:{_mode}"
         f"{'  (skipped)' if not needs_rag and not sender_addrs else ''}",
         flush=True,
     )
@@ -270,11 +382,27 @@ def _build_agent_messages(
     time_label, start_dt, end_dt = _detect_time_range(message)
 
     # Fan out all independent DB/RAG work in parallel.
+    # For voice, cache profile/mailboxes/prefs to skip ~200-400ms of DB work.
     t_fanout = time.perf_counter()
     with ThreadPoolExecutor(max_workers=4) as pool:
-        profile_f = pool.submit(get_profile, user_id)
-        mailboxes_f = pool.submit(lambda: list(mailboxes_col().find({"user_id": user_id})))
-        prefs_f = pool.submit(get_user_preferences_prompt, user_id)
+        if voice:
+            profile_f = pool.submit(
+                _cached, f"profile:{user_id}", _TTL_PROFILE,
+                lambda: get_profile(user_id),
+            )
+            mailboxes_f = pool.submit(
+                _cached, f"mboxes:{user_id}", _TTL_MAILBOXES,
+                lambda: list(mailboxes_col().find({"user_id": user_id})),
+            )
+            prefs_f = pool.submit(
+                _cached, f"prefs:{user_id}", _TTL_PREFS,
+                lambda: get_user_preferences_prompt(user_id),
+            )
+        else:
+            profile_f = pool.submit(get_profile, user_id)
+            mailboxes_f = pool.submit(lambda: list(mailboxes_col().find({"user_id": user_id})))
+            prefs_f = pool.submit(get_user_preferences_prompt, user_id)
+
         rag_f = pool.submit(
             _fetch_rag_context,
             user_id, message, mailbox_id, voice,
@@ -335,14 +463,24 @@ def _build_agent_messages(
         if c.get("email")
     ]
 
-    # Time-range note injected into both voice and non-voice system prompts.
+    # Context note injected into system prompts so LLM knows exactly what's shown.
     if time_label:
         period = time_label.replace("_", " ")
         _time_note = (
-            f"TIME FILTER ACTIVE — The user asked about '{period}'. "
+            f"FILTER ACTIVE — The user asked about '{period}'. "
             f"The {len(contents)} email(s) below are ALL emails found in that period. "
             "Base your answer ONLY on these emails. "
-            "If the list is empty, say no emails were received in that period — do NOT invent emails.\n\n"
+            "If the list is empty, say no emails were received in that period.\n\n"
+        )
+    elif want_unread:
+        _time_note = (
+            f"FILTER ACTIVE — Showing unread emails only ({len(contents)} found). "
+            "Base your answer on these unread emails.\n\n"
+        )
+    elif want_starred:
+        _time_note = (
+            f"FILTER ACTIVE — Showing starred emails only ({len(contents)} found). "
+            "Base your answer on these starred emails.\n\n"
         )
     else:
         _time_note = ""
@@ -504,38 +642,124 @@ def agent_chat(
     return {"content": clean_text, "actions": actions, "sources": sources}
 
 
+def _safe_tts(text: str) -> str | None:
+    """Generate TTS audio for one sentence. Returns base64 or None on failure."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    try:
+        return generate_speech(t).get("audio")
+    except Exception as e:
+        print(f"[TTS] streaming sentence failed: {e}", flush=True)
+        return None
+
+
 def agent_chat_stream(
     user_id: str,
     message: str,
     conversation_history: list | None = None,
     mailbox_id: str | None = None,
+    stream_tts: bool = False,
 ):
-    """Generator that yields SSE event dicts: token chunks then a final done event."""
+    """Stream LLM tokens (+ optional sentence-by-sentence TTS audio).
+
+    Events yielded:
+      - {"type": "token", "content": str} — LLM text delta
+      - {"type": "audio", "audio": base64, "text": sentence}  (only if stream_tts)
+      - {"type": "done", "content": str, "actions": [...], "sources": [...]}
+    """
     t_start = time.perf_counter()
     messages, max_out, sources = _build_agent_messages(user_id, message, conversation_history, mailbox_id, voice=True)
     t_rag_done = time.perf_counter()
     print(f"  [PREP] {t_rag_done - t_start:.2f}s — profile+RAG+prompt build", flush=True)
 
     full_response = ""
+    sentence_buffer = ""
+    tts_queue: deque = deque()
+    past_actions_marker = False  # once ``` appears, stop TTS (action JSON block)
+    tts_pool = ThreadPoolExecutor(max_workers=3) if stream_tts else None
     t_first_token = None
-    for token in chat_multi_stream(messages, temperature=0.6, max_tokens=max_out):
-        if t_first_token is None:
-            t_first_token = time.perf_counter()
-            print(f"  [TTFT] {t_first_token - t_rag_done:.2f}s — time to first LLM token", flush=True)
-        full_response += token
-        yield {"type": "token", "content": token}
 
-    t_llm_done = time.perf_counter()
-    print(
-        f"  [LLM]  {t_llm_done - (t_first_token or t_rag_done):.2f}s — stream duration  "
-        f"| {len(full_response)} chars total  "
-        f"| TOTAL {t_llm_done - t_start:.2f}s end-to-end",
-        flush=True,
-    )
+    try:
+        for token in chat_multi_stream(
+            messages,
+            temperature=0.3,
+            max_tokens=max_out,
+            model=_VOICE_MODEL,
+        ):
+            if t_first_token is None:
+                t_first_token = time.perf_counter()
+                print(f"  [TTFT] {t_first_token - t_rag_done:.2f}s — time to first LLM token", flush=True)
 
-    actions = _extract_actions(full_response)
-    clean_text = _clean_response(full_response)
-    yield {"type": "done", "content": clean_text, "actions": actions, "sources": sources}
+            full_response += token
+            yield {"type": "token", "content": token}
+
+            if not stream_tts:
+                continue
+
+            if past_actions_marker:
+                # Already passed the actions fence — skip TTS for remaining tokens.
+                continue
+
+            sentence_buffer += token
+
+            # If the actions fence appears inside the buffer, flush what comes
+            # BEFORE it as a final sentence and stop TTS for the rest.
+            if "```" in sentence_buffer:
+                before, _, _ = sentence_buffer.partition("```")
+                before = before.strip()
+                if before:
+                    tts_queue.append((before, tts_pool.submit(_safe_tts, before)))
+                sentence_buffer = ""
+                past_actions_marker = True
+                continue
+
+            # Detect complete sentences and launch TTS in parallel.
+            while True:
+                match = _SENTENCE_END_RE.search(sentence_buffer)
+                if not match:
+                    break
+                sentence = sentence_buffer[: match.end()].strip()
+                sentence_buffer = sentence_buffer[match.end():]
+                if sentence:
+                    tts_queue.append((sentence, tts_pool.submit(_safe_tts, sentence)))
+
+            # Emit any TTS audio that is ready (in-order).
+            while tts_queue and tts_queue[0][1].done():
+                sent, future = tts_queue.popleft()
+                audio = future.result()
+                if audio:
+                    yield {"type": "audio", "audio": audio, "text": sent}
+
+        t_llm_done = time.perf_counter()
+        print(
+            f"  [LLM]  {t_llm_done - (t_first_token or t_rag_done):.2f}s — stream duration  "
+            f"| {len(full_response)} chars total  "
+            f"| TOTAL {t_llm_done - t_start:.2f}s end-to-end",
+            flush=True,
+        )
+
+        # Flush the tail of the sentence buffer + drain pending TTS.
+        if stream_tts:
+            if not past_actions_marker and sentence_buffer.strip():
+                tail = sentence_buffer.strip()
+                tts_queue.append((tail, tts_pool.submit(_safe_tts, tail)))
+
+            for sent, future in list(tts_queue):
+                try:
+                    audio = future.result(timeout=10)
+                except Exception:
+                    audio = None
+                if audio:
+                    yield {"type": "audio", "audio": audio, "text": sent}
+            tts_queue.clear()
+
+        actions = _extract_actions(full_response)
+        clean_text = _clean_response(full_response)
+        yield {"type": "done", "content": clean_text, "actions": actions, "sources": sources}
+    finally:
+        if tts_pool is not None:
+            tts_pool.shutdown(wait=False)
 
 
 # ── Proactive suggestions ────────────────────────────────────────────────────

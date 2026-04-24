@@ -110,10 +110,14 @@ def chat_stream(request):
 
     history = data.get("history", [])
     mailbox_id = data.get("mailbox_id") or None
+    # Frontend can opt into sentence-by-sentence TTS audio in the stream.
+    stream_tts = bool(data.get("stream_tts", False))
 
     def event_stream():
         try:
-            for event in services.agent_chat_stream(user_id, message, history or None, mailbox_id):
+            for event in services.agent_chat_stream(
+                user_id, message, history or None, mailbox_id, stream_tts=stream_tts,
+            ):
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception:
             yield f"data: {json.dumps({'type': 'error', 'message': 'Internal error'})}\n\n"

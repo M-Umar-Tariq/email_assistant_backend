@@ -282,11 +282,13 @@ def list_emails(
         id_filter = sender_ids if id_filter is None else [eid for eid in id_filter if eid in set(sender_ids)]
     if id_filter is not None:
         if not id_filter:
-            return []
+            return {"emails": [], "total": 0}
         query["_id"] = {"$in": id_filter}
 
+    col = email_metadata_col()
+    total = col.count_documents(query)
     cursor = (
-        email_metadata_col()
+        col
         .find(query)
         .sort("date", -1)
         .skip(offset)
@@ -294,7 +296,7 @@ def list_emails(
     )
     mongo_docs = list(cursor)
     if not mongo_docs:
-        return []
+        return {"emails": [], "total": total}
 
     email_ids = [str(d["_id"]) for d in mongo_docs]
     content_map = get_emails_content_batch(email_ids, user_id)
@@ -305,7 +307,7 @@ def list_emails(
         content = content_map.get(eid, {})
         results.append(_merge_email(doc, content))
 
-    return results
+    return {"emails": results, "total": total}
 
 
 # ── Detail (body from Qdrant) ────────────────────────────────────────────────

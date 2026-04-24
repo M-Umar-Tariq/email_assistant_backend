@@ -98,6 +98,7 @@ def create_mailbox(user_id: str, data: dict) -> dict:
     }
     result = mailboxes_col().insert_one(doc)
     doc["_id"] = result.inserted_id
+    _invalidate_agent_cache(user_id)
     return _serialize(doc)
 
 
@@ -143,7 +144,17 @@ def update_mailbox(user_id: str, mailbox_id: str, data: dict) -> dict | None:
     mailboxes_col().update_one(
         {"_id": ObjectId(mailbox_id), "user_id": user_id}, {"$set": data}
     )
+    _invalidate_agent_cache(user_id)
     return get_mailbox(user_id, mailbox_id)
+
+
+def _invalidate_agent_cache(user_id: str) -> None:
+    """Drop the voice agent's in-memory cache when mailbox state changes."""
+    try:
+        from api.controllers.agent.services import invalidate_user_cache
+        invalidate_user_cache(user_id)
+    except Exception:
+        pass
 
 
 def delete_mailbox(user_id: str, mailbox_id: str) -> bool:
@@ -164,6 +175,7 @@ def delete_mailbox(user_id: str, mailbox_id: str) -> bool:
         email_metadata_col().delete_many({"user_id": user_id, "mailbox_id": mailbox_id})
         email_attachments_col().delete_many({"user_id": user_id, "mailbox_id": mailbox_id})
         _delete_qdrant_chunks_for_mailbox(user_id, mailbox_id)
+        _invalidate_agent_cache(user_id)
     return result.deleted_count > 0
 
 

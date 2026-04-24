@@ -494,11 +494,39 @@ def _exec_send_email(user_id: str, action: dict) -> dict:
     return {"details": details}
 
 
+def _get_content_with_mongo_fallback(email_id: str, user_id: str) -> dict | None:
+    """Try Qdrant first; if not indexed yet, build minimal content from MongoDB."""
+    content = get_email_content(email_id, user_id) if email_id else None
+    if content:
+        return content
+    if not email_id:
+        return None
+    meta = email_metadata_col().find_one({"_id": email_id, "user_id": user_id})
+    if not meta:
+        return None
+    date_val = meta.get("date")
+    date_str = date_val.isoformat() if isinstance(date_val, datetime) else str(date_val or "")
+    return {
+        "email_id": email_id,
+        "mailbox_id": meta.get("mailbox_id", ""),
+        "subject": meta.get("subject", ""),
+        "from_name": meta.get("from_name", ""),
+        "from_email": meta.get("from_email", ""),
+        "to": meta.get("to", []),
+        "date": date_str,
+        "preview": meta.get("preview", ""),
+        "body_chunk": meta.get("preview", ""),
+        "has_attachment": bool(meta.get("has_attachment", False)),
+        "priority": meta.get("priority", "medium"),
+        "attachment_text": "",
+    }
+
+
 def _exec_draft_reply(user_id: str, action: dict) -> dict:
     from api.controllers.settings.services import get_user_preferences_prompt
 
     email_id = _resolve_single_email_id(user_id, action)
-    content = get_email_content(email_id, user_id) if email_id else None
+    content = _get_content_with_mongo_fallback(email_id, user_id)
     if not content:
         raise ValueError(
             "Email not found for reply. Provide email_id, from_email, subject, or keywords."
@@ -529,7 +557,7 @@ def _exec_send_reply(user_id: str, action: dict) -> dict:
     from api.controllers.emails.services import reply_email as do_reply
 
     email_id = _resolve_reply_email_id(user_id, action)
-    content = get_email_content(email_id, user_id) if email_id else None
+    content = _get_content_with_mongo_fallback(email_id, user_id)
     if not content:
         raise ValueError(
             "Email not found for reply. Provide an exact email_id or from_email."
@@ -583,7 +611,7 @@ def _exec_reply_all(user_id: str, action: dict) -> dict:
     from api.controllers.emails.services import reply_email as do_reply
 
     email_id = _resolve_reply_email_id(user_id, action)
-    content = get_email_content(email_id, user_id) if email_id else None
+    content = _get_content_with_mongo_fallback(email_id, user_id)
     if not content:
         raise ValueError(
             "Email not found for reply_all. Provide an exact email_id or from_email."
