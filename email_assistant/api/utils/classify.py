@@ -54,14 +54,24 @@ def _assign_labels_batch(
     )
 
     system_prompt = (
-        "You are an email labelling assistant. The user has defined the following labels:\n"
+        "You are an email labeling assistant.\n"
+        "Goal: apply ONLY the user-defined labels listed below to each email.\n\n"
+        "Available labels (name -> instruction):\n"
         f"{rules_text}\n\n"
-        "For each email below, decide which labels apply (zero, one, or several).\n"
-        "Respond with ONLY a JSON array (no markdown, no explanation). "
-        "Each element is an array of matching label names (strings). "
-        "Use EXACT label names from the list above. "
-        "If no label fits an email, return an empty array [] for that email.\n"
-        f"The array must have exactly {len(batch)} elements, in the same order as the input emails."
+        "Decision rules:\n"
+        "- Read subject + sender + preview together before deciding.\n"
+        "- A label should be applied only when the email clearly matches that label's instruction.\n"
+        "- Do NOT infer weak matches from vague wording.\n"
+        "- It is valid to assign multiple labels to one email when each has clear evidence.\n"
+        "- If no label clearly fits, return an empty array for that email.\n"
+        "- Use label names EXACTLY as provided (case-sensitive, no synonyms, no new labels).\n"
+        "- Remove duplicates inside each email's label list.\n\n"
+        "Output format (STRICT):\n"
+        "- Return ONLY raw JSON.\n"
+        "- Top-level value: array with exactly "
+        f"{len(batch)} elements (same order as input emails).\n"
+        "- Each element: array of strings (label names).\n"
+        "- No markdown, no prose, no comments, no trailing text."
     )
 
     try:
@@ -135,14 +145,34 @@ def _classify_batch(batch: list[dict], user_prefs_hint: str = "") -> list[dict]:
     )
 
     system_prompt = (
-        "You are an email priority classifier. For each email, assign:\n"
-        "1. priority: 'high' (urgent, security alerts, important deadlines, boss/client emails), "
-        "'medium' (normal correspondence, updates), or 'low' (newsletters, promotions, spam-like)\n"
-        "2. category: one of 'important', 'updates', 'promotions', 'social', 'newsletters', 'finance', or null\n\n"
+        "You are an email priority + category classifier.\n"
+        "For each email, assign exactly one priority and one category (or null category).\n\n"
+        "Priority scale:\n"
+        "- high: urgent actions, hard deadlines, security/legal/financial risk, executive/client-critical items.\n"
+        "- medium: standard work communication, project updates, routine requests.\n"
+        "- low: newsletters, broad promotions, social notifications, low-urgency bulk messages.\n\n"
+        "Category options (must be one of):\n"
+        "- important\n"
+        "- updates\n"
+        "- promotions\n"
+        "- social\n"
+        "- newsletters\n"
+        "- finance\n"
+        "- null (if none clearly fits)\n\n"
+        "Classification guidelines:\n"
+        "- Prefer precision over over-classification.\n"
+        "- Use sender + subject + preview jointly.\n"
+        "- Promotional/marketing language usually maps to promotions or newsletters.\n"
+        "- Billing/invoices/payments/cost alerts usually map to finance.\n"
+        "- If signals conflict, prioritize direct urgency/actionability for priority.\n"
+        "- Never output categories outside the allowed set.\n\n"
         + user_prefs_hint +
-        "Respond with ONLY a JSON array (no markdown, no explanation). Each element: "
-        '{\"priority\": \"...\", \"category\": \"...\"}\n'
-        "The array must have exactly the same number of elements as input emails, in the same order."
+        "Output format (STRICT):\n"
+        "- Return ONLY raw JSON.\n"
+        "- Top-level value: array with exactly the same number of elements as input emails, in order.\n"
+        "- Each element is an object with keys:\n"
+        '  {"priority": "high|medium|low", "category": "important|updates|promotions|social|newsletters|finance|null"}\n'
+        "- No markdown, no explanation, no extra keys."
     )
 
     try:
@@ -368,18 +398,26 @@ def _extract_meetings_subbatch(batch: list[dict]) -> list[dict | None]:
             for j, it in enumerate(need_llm_items)
         )
         system_prompt = (
-            "You detect scheduled meetings, calls, or calendar events in emails.\n"
-            "For each email, if it proposes or confirms a specific meeting with BOTH a clear start and end "
-            "(or duration you can turn into an end), return one object; otherwise return null for that email.\n"
-            "Use the email's own language; times may be relative to 'Email date' if the email says 'tomorrow at 3pm'.\n"
-            "Respond with ONLY a JSON array of exactly "
-            f"{len(need_llm_items)} elements in order. Each element is either null or an object with:\n"
-            '  "title": string (short),\n'
-            '  "start": ISO 8601 datetime with timezone (e.g. 2026-04-07T13:00:00+00:00),\n'
-            '  "end": ISO 8601 datetime with timezone,\n'
-            '  "location": string or null,\n'
-            '  "attendees": array of email strings or empty array\n'
-            "If multiple time slots exist, pick the main/proposed meeting only."
+            "You extract real scheduled meetings/calls/events from email text.\n"
+            "Return one meeting object per email only when scheduling evidence is concrete.\n\n"
+            "When to return null:\n"
+            "- No clear meeting intent.\n"
+            "- Missing start/end and no reliable way to infer duration.\n"
+            "- Purely tentative chatter without a concrete slot.\n\n"
+            "Extraction rules:\n"
+            "- If email uses relative time (e.g., 'tomorrow 3pm'), resolve using the provided 'Email date'.\n"
+            "- Always output timezone-aware ISO 8601 for start/end.\n"
+            "- If duration is explicit (e.g., '30 minutes'), infer end from start.\n"
+            "- Keep title short and specific.\n"
+            "- Extract attendees only when clear email addresses exist.\n"
+            "- If multiple options are listed, choose the primary/proposed slot.\n\n"
+            "Output format (STRICT):\n"
+            "- Return ONLY raw JSON.\n"
+            "- Top-level value: array of exactly "
+            f"{len(need_llm_items)} elements, in order.\n"
+            "- Each element is either null or:\n"
+            '  {"title": string, "start": ISO8601-with-timezone, "end": ISO8601-with-timezone, "location": string|null, "attendees": string[]}\n'
+            "- No markdown, no explanation, no extra keys."
         )
         try:
             raw = chat(

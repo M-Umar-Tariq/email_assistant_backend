@@ -14,6 +14,7 @@ from api.utils.llm import chat
 
 
 def execute_action(user_id: str, action: dict) -> dict:
+    action = _normalize_action_mailbox_scope(action)
     action_type = action.get("type", "")
     executors = {
         "read_emails": _exec_read_emails,
@@ -977,6 +978,18 @@ def _default_mailbox_id(user_id: str) -> str:
     if not mb:
         raise ValueError("No mailbox found — please add a mailbox first.")
     return str(mb["_id"])
+
+
+def _normalize_action_mailbox_scope(action: dict) -> dict:
+    """Treat synthetic mailbox values as global scope (None)."""
+    if not isinstance(action, dict):
+        return action
+    mb = action.get("mailbox_id")
+    if isinstance(mb, str):
+        cleaned = mb.strip()
+        if not cleaned or cleaned.lower() in {"all", "*", "any"}:
+            action["mailbox_id"] = None
+    return action
 
 
 def _log(user_id: str, action: dict, status: str, details: str = "") -> dict:

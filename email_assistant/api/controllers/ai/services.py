@@ -147,6 +147,18 @@ _NEEDS_CONTENT_RE = re.compile(
     re.I,
 )
 
+_ATTACHMENT_QUERY_RE = re.compile(
+    r"\b(attachment|attachments|file|files|pdf|docx?|xlsx?|csv|pptx?|document|spreadsheet)\b"
+    r"|فائل|فائلز|اٹیچ(?:منٹ)?|attachment",
+    re.I,
+)
+
+_THREAD_QUERY_RE = re.compile(
+    r"\b(thread|conversation|email\s+chain|entire\s+chain|full\s+thread|poora\s+thread|puri\s+conversation)\b"
+    r"|تھریڈ|کنورسیشن",
+    re.I,
+)
+
 
 def _is_fast_action(query: str) -> bool:
     """True for pure state-changing actions that don't need email bodies in the prompt.
@@ -160,6 +172,14 @@ def _is_fast_action(query: str) -> bool:
         bool(_FAST_ACTION_VERBS.search(query))
         and not _NEEDS_CONTENT_RE.search(query)
     )
+
+
+def _is_attachment_query(query: str) -> bool:
+    return bool(_ATTACHMENT_QUERY_RE.search(query))
+
+
+def _is_thread_query(query: str) -> bool:
+    return bool(_THREAD_QUERY_RE.search(query))
 
 
 def _query_context_budget(query: str) -> dict:
@@ -178,6 +198,16 @@ def _query_context_budget(query: str) -> dict:
 
     if _COUNT_RE.search(q):
         return {"limit": 50, "chunks": 150, "rerank": 80}
+
+    if _is_attachment_query(q):
+        # Attachment/file queries need richer per-email payloads, so keep result
+        # set focused and let the prompt include full blocks instead of compact mode.
+        return {"limit": 12, "chunks": 200, "rerank": 120}
+
+    if _is_thread_query(q):
+        # Thread questions should prioritize quality over breadth, then expand to
+        # the full thread after primary retrieval.
+        return {"limit": 8, "chunks": 120, "rerank": 80}
 
     if _is_broad_query(q):
         return {"limit": 40, "chunks": 150, "rerank": 80}
@@ -337,6 +367,7 @@ def _fetch_emails_by_date(
     limit: int = 0,
     read_filter: bool | None = None,
     starred_filter: bool | None = None,
+    has_attachment_only: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """Fetch emails from MongoDB by date range, then load content from Qdrant.
     Returns (contents, metas) sorted by date descending. limit=0 means no limit.
@@ -358,6 +389,8 @@ def _fetch_emails_by_date(
         query_filter["read"] = read_filter
     if starred_filter is not None:
         query_filter["starred"] = starred_filter
+    if has_attachment_only:
+        query_filter["has_attachment"] = True
 
     cursor = email_metadata_col().find(query_filter).sort("date", -1)
     if limit > 0:
@@ -408,6 +441,7 @@ def _fetch_emails_by_vector(
     *,
     search_chunk_limit: int = 500,
     rerank_cap: int | None = None,
+    has_attachment_only: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """Vector search + rerank, returns (contents, metas) deduplicated by email. limit=None means no limit.
 
@@ -419,6 +453,8 @@ def _fetch_emails_by_vector(
     must_filters = [FieldCondition(key="user_id", match=MatchValue(value=user_id))]
     if mailbox_id:
         must_filters.append(FieldCondition(key="mailbox_id", match=MatchValue(value=mailbox_id)))
+    if has_attachment_only:
+        must_filters.append(FieldCondition(key="has_attachment", match=MatchValue(value=True)))
 
     qdrant = get_qdrant()
     search_response = qdrant.query_points(
@@ -498,6 +534,61 @@ def _fetch_emails_by_vector(
     return contents, metas
 
 
+def _expand_to_primary_thread(
+    user_id: str,
+    mailbox_id: str | None,
+    contents: list[dict],
+    metas: list[dict],
+    max_emails: int = 30,
+) -> tuple[list[dict], list[dict]]:
+    """If we can identify a primary thread_id, replace context with that full thread."""
+    if not contents or not metas:
+        return contents, metas
+
+    primary = metas[0] if metas else None
+    thread_id = (primary or {}).get("thread_id")
+    if not thread_id:
+        return contents, metas
+
+    q: dict = {
+        "user_id": user_id,
+        "thread_id": thread_id,
+        "archived": {"$ne": True},
+        "trashed": {"$ne": True},
+    }
+    if mailbox_id:
+        q["mailbox_id"] = mailbox_id
+
+    thread_metas = list(email_metadata_col().find(q).sort("date", -1).limit(max_emails))
+    if not thread_metas:
+        return contents, metas
+
+    email_ids = [str(m["_id"]) for m in thread_metas]
+    content_map = get_emails_content_batch(email_ids, user_id)
+    thread_contents: list[dict] = []
+    for m in thread_metas:
+        eid = str(m["_id"])
+        c = content_map.get(eid)
+        if not c:
+            date_val = m.get("date")
+            date_str = date_val.isoformat() if isinstance(date_val, datetime) else str(date_val or "")
+            c = {
+                "email_id": eid,
+                "subject": m.get("subject", ""),
+                "from_name": m.get("from_name", ""),
+                "from_email": m.get("from_email", ""),
+                "to": m.get("to", []),
+                "date": date_str,
+                "preview": m.get("preview", ""),
+                "has_attachment": bool(m.get("has_attachment", False)),
+                "priority": m.get("priority", "medium"),
+                "body_chunk": m.get("preview", ""),
+                "attachment_text": "",
+            }
+        thread_contents.append(c)
+    return thread_contents, thread_metas
+
+
 # ── Main ask function ─────────────────────────────────────────────────────────
 
 def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list | None = None, user_tz: str | None = None) -> dict:
@@ -509,6 +600,8 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
             pass
 
     is_fast = _is_fast_action(query)
+    attachment_focus = _is_attachment_query(query)
+    thread_focus = _is_thread_query(query)
     time_label = ""
 
     if is_fast:
@@ -538,7 +631,15 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
             contents, metas = _fetch_emails_by_date(
                 user_id, start_dt, end_dt, mailbox_id,
                 limit=budget["limit"],
+                has_attachment_only=attachment_focus,
             )
+            if attachment_focus and not contents:
+                # If attachment-only narrowing is too strict for this period, retry without it.
+                contents, metas = _fetch_emails_by_date(
+                    user_id, start_dt, end_dt, mailbox_id,
+                    limit=budget["limit"],
+                    has_attachment_only=False,
+                )
 
             # Only fall back to vector search when NO specific time range was
             # requested. If the user asked about "today" / "this week" etc. and
@@ -550,13 +651,40 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
                     limit=budget["limit"],
                     search_chunk_limit=budget["chunks"],
                     rerank_cap=budget["rerank"],
+                    has_attachment_only=attachment_focus,
                 )
+                if attachment_focus and not contents:
+                    contents, metas = _fetch_emails_by_vector(
+                        user_id, query, mailbox_id,
+                        limit=budget["limit"],
+                        search_chunk_limit=budget["chunks"],
+                        rerank_cap=budget["rerank"],
+                        has_attachment_only=False,
+                    )
         else:
             contents, metas = _fetch_emails_by_vector(
                 user_id, query, mailbox_id,
                 limit=budget["limit"],
                 search_chunk_limit=budget["chunks"],
                 rerank_cap=budget["rerank"],
+                has_attachment_only=attachment_focus,
+            )
+            if attachment_focus and not contents:
+                contents, metas = _fetch_emails_by_vector(
+                    user_id, query, mailbox_id,
+                    limit=budget["limit"],
+                    search_chunk_limit=budget["chunks"],
+                    rerank_cap=budget["rerank"],
+                    has_attachment_only=False,
+                )
+
+        if thread_focus:
+            contents, metas = _expand_to_primary_thread(
+                user_id=user_id,
+                mailbox_id=mailbox_id,
+                contents=contents,
+                metas=metas,
+                max_emails=30,
             )
 
         if not contents:
@@ -578,7 +706,7 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
         FULL_CUTOFF = 35
         # For fast state-change actions we never need full bodies — the AI only
         # needs IDs + headers to target specific emails.
-        use_compact = is_fast or len(contents) > FULL_CUTOFF
+        use_compact = (is_fast or len(contents) > FULL_CUTOFF) and not attachment_focus and not thread_focus
         context_blocks = []
         sources = []
         for i, (c, m) in enumerate(zip(contents, metas)):
@@ -806,7 +934,7 @@ def ask(user_id: str, query: str, mailbox_id: str | None = None, history: list |
 
     response_text = chat_multi(messages, temperature=0.4, max_tokens=2048 if is_fast else 8192)
 
-    actions = _extract_actions(response_text)
+    actions = _extract_actions(response_text, mailbox_id=mailbox_id)
     clean_text = _clean_response(response_text)
 
     return {
@@ -951,14 +1079,31 @@ def get_instant_replies(user_id: str, email_id: str) -> list[dict]:
 
 # ── Action extraction helpers ─────────────────────────────────────────────────
 
-def _extract_actions(text: str) -> list[dict]:
+def _normalize_mailbox_scope(mailbox_id: str | None) -> str | None:
+    """Normalize mailbox scope hints coming from frontend context."""
+    if not mailbox_id:
+        return None
+    cleaned = str(mailbox_id).strip()
+    if not cleaned or cleaned.lower() in {"all", "*", "any"}:
+        return None
+    return cleaned
+
+
+def _extract_actions(text: str, mailbox_id: str | None = None) -> list[dict]:
     actions: list[dict] = []
+    scoped_mailbox_id = _normalize_mailbox_scope(mailbox_id)
     for match in re.findall(r"```actions?\s*\n(.*?)\n```", text, re.DOTALL):
         try:
             parsed = json.loads(match.strip())
             if isinstance(parsed, list):
                 ts = int(datetime.now(timezone.utc).timestamp())
                 for i, a in enumerate(parsed):
+                    if (
+                        scoped_mailbox_id
+                        and isinstance(a, dict)
+                        and not a.get("mailbox_id")
+                    ):
+                        a["mailbox_id"] = scoped_mailbox_id
                     a["id"] = f"act-{i}-{ts}"
                     a["requires_approval"] = True
                     a["status"] = "awaiting_approval"

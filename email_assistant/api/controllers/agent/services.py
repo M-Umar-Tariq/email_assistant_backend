@@ -637,7 +637,7 @@ def agent_chat(
 ) -> dict:
     messages, max_out, sources = _build_agent_messages(user_id, message, conversation_history, mailbox_id)
     response_text = chat_multi(messages, temperature=0.6, max_tokens=max_out)
-    actions = _extract_actions(response_text)
+    actions = _extract_actions(response_text, mailbox_id=mailbox_id)
     clean_text = _clean_response(response_text)
     return {"content": clean_text, "actions": actions, "sources": sources}
 
@@ -754,7 +754,7 @@ def agent_chat_stream(
                     yield {"type": "audio", "audio": audio, "text": sent}
             tts_queue.clear()
 
-        actions = _extract_actions(full_response)
+        actions = _extract_actions(full_response, mailbox_id=mailbox_id)
         clean_text = _clean_response(full_response)
         yield {"type": "done", "content": clean_text, "actions": actions, "sources": sources}
     finally:
@@ -950,14 +950,30 @@ def _format_profile(profile: dict) -> str:
     return "\n".join(parts) if parts else "No profile data yet — will learn as more emails come in."
 
 
-def _extract_actions(text: str) -> list[dict]:
+def _normalize_mailbox_scope(mailbox_id: str | None) -> str | None:
+    if not mailbox_id:
+        return None
+    cleaned = str(mailbox_id).strip()
+    if not cleaned or cleaned.lower() in {"all", "*", "any"}:
+        return None
+    return cleaned
+
+
+def _extract_actions(text: str, mailbox_id: str | None = None) -> list[dict]:
     actions: list[dict] = []
+    scoped_mailbox_id = _normalize_mailbox_scope(mailbox_id)
     for match in re.findall(r"```actions?\s*\n(.*?)\n```", text, re.DOTALL):
         try:
             parsed = json.loads(match.strip())
             if isinstance(parsed, list):
                 ts = int(datetime.now(timezone.utc).timestamp())
                 for i, a in enumerate(parsed):
+                    if (
+                        scoped_mailbox_id
+                        and isinstance(a, dict)
+                        and not a.get("mailbox_id")
+                    ):
+                        a["mailbox_id"] = scoped_mailbox_id
                     a["id"] = f"act-{i}-{ts}"
                     a["requires_approval"] = True
                     a["status"] = "awaiting_approval"

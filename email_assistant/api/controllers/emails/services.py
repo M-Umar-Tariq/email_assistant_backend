@@ -596,12 +596,22 @@ def bulk_update_emails(user_id: str, email_ids: list[str], data: dict) -> dict:
     by_mailbox = _group_metas_by_mailbox(metas)
     for mb_id, mids in by_mailbox.items():
         if "read" in update_fields:
-            mailbox_services.bulk_set_flag_on_imap(
-                user_id, mb_id, mids, b"\\Seen", update_fields["read"]
+            _imap_bg(
+                mailbox_services.bulk_set_flag_on_imap,
+                user_id,
+                mb_id,
+                mids,
+                b"\\Seen",
+                update_fields["read"],
             )
         if "starred" in update_fields:
-            mailbox_services.bulk_set_flag_on_imap(
-                user_id, mb_id, mids, b"\\Flagged", update_fields["starred"]
+            _imap_bg(
+                mailbox_services.bulk_set_flag_on_imap,
+                user_id,
+                mb_id,
+                mids,
+                b"\\Flagged",
+                update_fields["starred"],
             )
     return {"processed": len(ids), "failed": failed}
 
