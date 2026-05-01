@@ -1492,12 +1492,23 @@ def _detect_server_restores(user_id: str, mailbox_id: str) -> int:
     restored = 0
     try:
         with _imap_client_for_mailbox(mb) as client:
+            folders = [f[2] for f in client.list_folders()]
+            trash_folder = _resolve_bulk_dest_folder(folders, _TRASH_FOLDER_CANDIDATES)
             client.select_folder("INBOX", readonly=True)
             for doc in trashed_docs:
                 mid = (doc.get("message_id") or "").strip()
                 if not mid:
                     continue
                 try:
+                    if trash_folder:
+                        try:
+                            client.select_folder(trash_folder, readonly=True)
+                            if client.search(["HEADER", "Message-ID", mid]):
+                                continue
+                        except Exception:
+                            pass
+                        finally:
+                            client.select_folder("INBOX", readonly=True)
                     uids = client.search(["HEADER", "Message-ID", mid])
                     if uids:
                         email_metadata_col().update_one(
@@ -1860,7 +1871,7 @@ def _move_email_on_imap(
         with _imap_client_for_mailbox(mb) as client:
             folders = [f[2] for f in client.list_folders()]
 
-            target = _resolve_folder(folders, dest_folder)
+            target = _resolve_bulk_dest_folder(folders, dest_folder)
             if not target:
                 print(f"[IMAP MOVE] No matching dest folder for '{dest_folder}' among {folders}")
                 return False
@@ -1899,7 +1910,7 @@ def archive_email_on_imap(user_id: str, mailbox_id: str, message_id: str) -> boo
 
 
 def trash_email_on_imap(user_id: str, mailbox_id: str, message_id: str) -> bool:
-    return _move_email_on_imap(user_id, mailbox_id, message_id, "[Gmail]/Trash|Trash|INBOX.Trash|Deleted Items|Deleted")
+    return _move_email_on_imap(user_id, mailbox_id, message_id, _TRASH_FOLDER_CANDIDATES)
 
 
 def spam_email_on_imap(user_id: str, mailbox_id: str, message_id: str) -> bool:
@@ -1915,9 +1926,48 @@ def spam_email_on_imap(user_id: str, mailbox_id: str, message_id: str) -> bool:
 
 
 _ARCHIVE_FOLDER_CANDIDATES = "[Gmail]/All Mail|Archive|All Mail|INBOX.Archive"
-_TRASH_FOLDER_CANDIDATES = "[Gmail]/Trash|Trash|INBOX.Trash|Deleted Items|Deleted"
+_TRASH_FOLDER_CANDIDATES = (
+    "[Google Mail]/Trash|[Gmail]/Trash|Trash|INBOX.Trash|Deleted Items|Deleted Messages|Deleted"
+)
 _SPAM_FOLDER_CANDIDATES = "[Gmail]/Spam|Spam|Junk|INBOX.Spam|INBOX.Junk|Junk Email"
 _INBOX_FOLDER_CANDIDATES = "INBOX|Inbox"
+
+_TRASH_LEAF_NAMES = frozenset(
+    {"trash", "deleted", "deleted items", "deleted messages", "bin", "rubbish"}
+)
+
+
+def _imap_folder_leaf(folder: str) -> str:
+    """Last segment of an IMAP folder name (handles / and INBOX.* hierarchies)."""
+    if not folder:
+        return ""
+    s = folder.replace("\\", "/").strip()
+    segment = s.rsplit("/", 1)[-1]
+    if "." in segment:
+        parts = segment.split(".")
+        if len(parts) >= 2 and parts[0].upper() == "INBOX":
+            segment = parts[-1]
+        elif len(parts) >= 2:
+            segment = parts[-1]
+    return segment.strip().lower()
+
+
+def _fallback_trash_folder_by_leaf(folders: list[str]) -> str | None:
+    """When explicit Trash candidates do not match LIST output, pick by folder leaf name."""
+    for f in folders:
+        if _imap_folder_leaf(f) in _TRASH_LEAF_NAMES:
+            return f
+    return None
+
+
+def _resolve_bulk_dest_folder(folders: list[str], dest_folder_candidates: str) -> str | None:
+    """Resolve destination folder; Trash gets an extra basename fallback for unknown providers."""
+    target = _resolve_folder(folders, dest_folder_candidates)
+    if target:
+        return target
+    if dest_folder_candidates == _TRASH_FOLDER_CANDIDATES:
+        return _fallback_trash_folder_by_leaf(folders)
+    return None
 
 
 def _collect_uids(client, message_ids: list[str]) -> list[int]:
@@ -2017,7 +2067,7 @@ def bulk_move_on_imap(
         with _imap_client_for_mailbox(mb) as client:
             folders = [f[2] for f in client.list_folders()]
 
-            target = _resolve_folder(folders, dest_folder_candidates)
+            target = _resolve_bulk_dest_folder(folders, dest_folder_candidates)
             if not target:
                 print(f"[IMAP BULK MOVE] No matching dest folder for '{dest_folder_candidates}'")
                 return 0
