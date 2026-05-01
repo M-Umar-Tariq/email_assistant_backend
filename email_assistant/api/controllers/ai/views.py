@@ -37,6 +37,18 @@ def instant_replies(request, email_id):
     return Response(replies)
 
 
+@api_view(["POST"])
+@jwt_required
+def inbox_filter(request):
+    """Translate a natural-language inbox query into structured filter params."""
+    query = (request.data.get("query") or "").strip()
+    if not query:
+        return Response({"error": "query is required"}, status=status.HTTP_400_BAD_REQUEST)
+    user_tz = request.data.get("timezone") or None
+    result = services.build_inbox_filter(query, user_tz=user_tz)
+    return Response(result)
+
+
 @api_view(["GET"])
 def suggested_questions(request):
     return Response([

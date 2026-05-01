@@ -24,10 +24,22 @@ def create_follow_up(user_id: str, data: dict) -> dict:
     return _serialize(doc)
 
 
-def list_follow_ups(user_id: str, status_filter: str | None = None) -> list[dict]:
+def list_follow_ups(
+    user_id: str,
+    status_filter: str | None = None,
+    mailbox_id: str | None = None,
+) -> list[dict]:
     query: dict = {"user_id": user_id}
     if status_filter and status_filter != "all":
         query["status"] = status_filter
+    if mailbox_id:
+        scoped_email_ids = list(
+            email_metadata_col().distinct(
+                "_id",
+                {"user_id": user_id, "mailbox_id": mailbox_id},
+            )
+        )
+        query["email_id"] = {"$in": [str(v) for v in scoped_email_ids]} if scoped_email_ids else {"$in": []}
     docs = list(follow_ups_col().find(query).sort("due_date", 1))
     if not docs:
         return []

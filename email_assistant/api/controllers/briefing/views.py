@@ -8,12 +8,14 @@ from . import services
 @api_view(["GET"])
 @jwt_required
 def briefing(request):
-    data = services.get_briefing(request.user_id)
+    mailbox_id = request.query_params.get("mailbox_id")
+    data = services.get_briefing(request.user_id, mailbox_id=mailbox_id)
     return Response(data)
 
 
 @api_view(["GET"])
 @jwt_required
 def ai_briefing(request):
-    text = services.generate_ai_briefing(request.user_id)
+    mailbox_id = request.query_params.get("mailbox_id")
+    text = services.generate_ai_briefing(request.user_id, mailbox_id=mailbox_id)
     return Response({"briefing": text})

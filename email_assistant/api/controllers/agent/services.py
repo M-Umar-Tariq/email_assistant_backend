@@ -844,12 +844,12 @@ def reject_action(action_id: str) -> dict:
 
 # ── Profile pass-through ─────────────────────────────────────────────────────
 
-def get_user_profile(user_id: str) -> dict:
-    return get_profile(user_id)
+def get_user_profile(user_id: str, mailbox_id: str | None = None) -> dict:
+    return get_profile(user_id, mailbox_id=mailbox_id)
 
 
-def build_user_profile(user_id: str) -> dict:
-    return get_profile(user_id, force_rebuild=True)
+def build_user_profile(user_id: str, mailbox_id: str | None = None) -> dict:
+    return get_profile(user_id, mailbox_id=mailbox_id, force_rebuild=True)
 
 
 # ── Text-to-speech ────────────────────────────────────────────────────────────

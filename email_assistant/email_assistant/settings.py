@@ -148,6 +148,8 @@ QDRANT_COLLECTION_EMAIL_CHUNKS = os.getenv("QDRANT_COLLECTION_EMAIL_CHUNKS", "em
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+# Optional: faster/cheaper model for NL → inbox JSON only (defaults to OPENAI_CHAT_MODEL).
+OPENAI_INBOX_FILTER_MODEL = (os.getenv("OPENAI_INBOX_FILTER_MODEL") or "").strip() or None
 
 # ---------------------------------------------------------------------------
 # Cohere
@@ -173,6 +175,18 @@ ADMIN_EMAILS = frozenset(
 # Encryption (Fernet key for IMAP/SMTP passwords)
 # ---------------------------------------------------------------------------
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
+
+# ---------------------------------------------------------------------------
+# Google OAuth (Gmail connect)
+# ---------------------------------------------------------------------------
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "")
+GOOGLE_OAUTH_SCOPES = os.getenv(
+    "GOOGLE_OAUTH_SCOPES",
+    "openid email profile https://mail.google.com/",
+)
+FRONTEND_APP_URL = os.getenv("FRONTEND_APP_URL", "http://localhost:3000")
 
 # ---------------------------------------------------------------------------
 # Chunking

@@ -5,7 +5,10 @@ import re
 import time
 import traceback
 import uuid
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone, timedelta
+from contextlib import contextmanager
 from email.header import decode_header as decode_email_header
 
 from bson import ObjectId
@@ -14,6 +17,7 @@ from pymongo.errors import DuplicateKeyError
 from api.utils.email_body import clean_email_body, collapse_long_urls_in_html
 from api.utils.attachment_text import extract_attachments_from_message
 from django.conf import settings
+from django.core import signing
 from imapclient import IMAPClient
 
 from database.db import (
@@ -60,6 +64,161 @@ def _connect_imap(imap_host: str, imap_port: int, imap_secure: bool) -> IMAPClie
     return client
 
 
+def _google_oauth_configured() -> bool:
+    return bool(
+        settings.GOOGLE_CLIENT_ID
+        and settings.GOOGLE_CLIENT_SECRET
+        and settings.GOOGLE_REDIRECT_URI
+    )
+
+
+def _google_scopes() -> str:
+    return (settings.GOOGLE_OAUTH_SCOPES or "").strip()
+
+
+def _create_oauth_state(user_id: str) -> str:
+    payload = {"user_id": user_id, "nonce": str(uuid.uuid4())}
+    return signing.dumps(payload, salt="google-oauth-state")
+
+
+def _parse_oauth_state(state: str) -> dict:
+    return signing.loads(state, salt="google-oauth-state", max_age=900)
+
+
+def build_google_auth_url(user_id: str) -> str:
+    if not _google_oauth_configured():
+        raise ValueError("Google OAuth is not configured in backend env.")
+    state = _create_oauth_state(user_id)
+    params = {
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": _google_scopes(),
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+        "state": state,
+    }
+    return f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
+
+
+def _google_token_exchange(code: str) -> dict:
+    payload = urllib.parse.urlencode(
+        {
+            "code": code,
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as res:
+        return json.loads(res.read().decode("utf-8"))
+
+
+def _google_refresh_access_token(refresh_token: str) -> dict:
+    payload = urllib.parse.urlencode(
+        {
+            "refresh_token": refresh_token,
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as res:
+        return json.loads(res.read().decode("utf-8"))
+
+
+def _google_userinfo(access_token: str) -> dict:
+    req = urllib.request.Request(
+        "https://www.googleapis.com/oauth2/v2/userinfo",
+        headers={"Authorization": f"Bearer {access_token}"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=20) as res:
+        return json.loads(res.read().decode("utf-8"))
+
+
+def _token_expired(expiry_iso: str | None) -> bool:
+    if not expiry_iso:
+        return True
+    try:
+        expiry = datetime.fromisoformat(expiry_iso)
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        return expiry <= (datetime.now(timezone.utc) + timedelta(seconds=30))
+    except Exception:
+        return True
+
+
+def _get_google_access_token_for_mailbox(mb: dict) -> str:
+    enc_refresh = mb.get("google_encrypted_refresh_token")
+    if not enc_refresh:
+        raise RuntimeError("Google mailbox is missing refresh token.")
+    refresh_token = decrypt(enc_refresh)
+    cached_access = mb.get("google_encrypted_access_token")
+    if cached_access and not _token_expired(mb.get("google_access_token_expires_at")):
+        return decrypt(cached_access)
+    refreshed = _google_refresh_access_token(refresh_token)
+    access_token = (refreshed.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("Google token refresh failed.")
+    expires_in = int(refreshed.get("expires_in") or 3600)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(expires_in - 30, 60))
+    mailboxes_col().update_one(
+        {"_id": mb["_id"]},
+        {
+            "$set": {
+                "google_encrypted_access_token": encrypt(access_token),
+                "google_access_token_expires_at": expires_at.isoformat(),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    return access_token
+
+
+def _login_imap_client(client: IMAPClient, mb: dict) -> None:
+    if mb.get("auth_type") == "google_oauth":
+        access_token = _get_google_access_token_for_mailbox(mb)
+        client.oauth2_login(mb["username"], access_token)
+        return
+    password = decrypt(mb["encrypted_password"])
+    client.login(mb["username"], password)
+
+
+def get_smtp_auth_for_mailbox(mb: dict) -> tuple[bool, str]:
+    """Return (is_oauth, credential) for SMTP authentication."""
+    if mb.get("auth_type") == "google_oauth":
+        return True, _get_google_access_token_for_mailbox(mb)
+    return False, decrypt(mb["encrypted_password"])
+
+
+@contextmanager
+def _imap_client_for_mailbox(mb: dict):
+    client = _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"])
+    try:
+        _login_imap_client(client, mb)
+        yield client
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
+
+
 def verify_imap_connection(imap_host: str, imap_port: int, imap_secure: bool, username: str, password: str) -> None:
     """Verify IMAP credentials by connecting and selecting INBOX. Raises ValueError on failure."""
     try:
@@ -68,6 +227,63 @@ def verify_imap_connection(imap_host: str, imap_port: int, imap_secure: bool, us
             client.select_folder("INBOX", readonly=True)
     except Exception as e:
         raise ValueError(_imap_friendly_error(str(e).strip()))
+
+
+def create_google_mailbox_from_callback(code: str, state: str) -> tuple[dict, str]:
+    state_payload = _parse_oauth_state(state)
+    user_id = str(state_payload.get("user_id") or "").strip()
+    if not user_id:
+        raise ValueError("Invalid OAuth state.")
+    token_data = _google_token_exchange(code)
+    access_token = (token_data.get("access_token") or "").strip()
+    refresh_token = (token_data.get("refresh_token") or "").strip()
+    if not access_token or not refresh_token:
+        raise ValueError("Google OAuth did not return required tokens.")
+    userinfo = _google_userinfo(access_token)
+    email_addr = (userinfo.get("email") or "").strip().lower()
+    if not email_addr:
+        raise ValueError("Google account email not found.")
+    display_name = (userinfo.get("name") or "").strip() or email_addr.split("@")[0]
+
+    existing = mailboxes_col().find_one({"user_id": user_id, "email": email_addr})
+    expires_in = int(token_data.get("expires_in") or 3600)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(expires_in - 30, 60))
+    common_updates = {
+        "name": display_name,
+        "email": email_addr,
+        "color": "#0ea5e9",
+        "imap_host": "imap.gmail.com",
+        "imap_port": 993,
+        "imap_secure": True,
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 587,
+        "smtp_secure": True,
+        "username": email_addr,
+        "auth_type": "google_oauth",
+        "provider": "gmail",
+        "google_encrypted_access_token": encrypt(access_token),
+        "google_encrypted_refresh_token": encrypt(refresh_token),
+        "google_access_token_expires_at": expires_at.isoformat(),
+        "sync_status": "pending",
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if existing:
+        mailboxes_col().update_one({"_id": existing["_id"]}, {"$set": common_updates})
+        existing.update(common_updates)
+        _invalidate_agent_cache(user_id)
+        return _serialize(existing), user_id
+
+    doc = {
+        **common_updates,
+        "user_id": user_id,
+        "encrypted_password": "",
+        "last_sync_at": None,
+        "created_at": datetime.now(timezone.utc),
+    }
+    result = mailboxes_col().insert_one(doc)
+    doc["_id"] = result.inserted_id
+    _invalidate_agent_cache(user_id)
+    return _serialize(doc), user_id
 
 
 def create_mailbox(user_id: str, data: dict) -> dict:
@@ -210,11 +426,10 @@ def sync_mailbox(
 
     # Only new: no message backfill — record current INBOX UID watermark so later syncs are incremental by UID.
     if initial_sync == "only_new":
-        password = decrypt(mb["encrypted_password"])
         imap_client = None
         try:
             imap_client = _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"])
-            imap_client.login(mb["username"], password)
+            _login_imap_client(imap_client, mb)
             folder_meta = imap_client.select_folder("INBOX", readonly=True)
             uidvalidity = folder_meta.get(b"UIDVALIDITY")
             uid_next = folder_meta.get(b"UIDNEXT")
@@ -232,6 +447,11 @@ def sync_mailbox(
         except Exception as e:
             err_msg = str(e).strip()
             if "LOGIN" in err_msg or "BAD" in err_msg or "AUTHENTICATIONFAILED" in err_msg.upper():
+                if mb.get("auth_type") == "google_oauth":
+                    raise RuntimeError(
+                        "Gmail OAuth IMAP login failed. Please reconnect this mailbox with Google. "
+                        "Also ensure GOOGLE_OAUTH_SCOPES includes https://mail.google.com/ and then reconnect."
+                    )
                 raise RuntimeError(
                     "IMAP login failed. Check that the username is your full email and the password is correct. "
                     "For Gmail, use an App Password (not your normal password). For Outlook, enable IMAP and use your password or app password."
@@ -271,14 +491,12 @@ def sync_mailbox(
         total = email_metadata_col().count_documents({"user_id": user_id, "mailbox_id": mailbox_id})
         return {"synced": 0, "total": total, "total_fetched": 0, "skipped_reason": "already_syncing"}
 
-    password = decrypt(mb["encrypted_password"])
-
     IMAP_BATCH = 10  # fetch N emails at a time from IMAP for fast first-result
 
     # 1) Connect to IMAP & get message IDs (fast — no email data downloaded yet)
     try:
         imap_client = _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"])
-        imap_client.login(mb["username"], password)
+        _login_imap_client(imap_client, mb)
         folder_meta = imap_client.select_folder("INBOX", readonly=True)
         uidvalidity = folder_meta.get(b"UIDVALIDITY")
         stored_v = mb.get("imap_uidvalidity")
@@ -342,6 +560,11 @@ def sync_mailbox(
         )
         err_msg = str(e).strip()
         if "LOGIN" in err_msg or "BAD" in err_msg or "AUTHENTICATIONFAILED" in err_msg.upper():
+            if mb.get("auth_type") == "google_oauth":
+                raise RuntimeError(
+                    "Gmail OAuth IMAP login failed. Please reconnect this mailbox with Google. "
+                    "Also ensure GOOGLE_OAUTH_SCOPES includes https://mail.google.com/ and then reconnect."
+                )
             raise RuntimeError(
                 "IMAP login failed. Check that the username is your full email and the password is correct. "
                 "For Gmail, use an App Password (not your normal password). For Outlook, enable IMAP and use your password or app password."
@@ -474,6 +697,9 @@ def sync_mailbox(
                     cid_map = _get_inline_image_cids(msg)
                     body_html = _replace_cid_in_html(body_html, cid_map)
                     body_html = collapse_long_urls_in_html(body_html)
+                # HTML-only messages often have an empty text/plain part; derive plain body for UI / thread replies.
+                if (not body or not str(body).strip()) and body_html:
+                    body = clean_email_body(body_html) or body
                 subject = _decode_header_value(msg.get("Subject", ""))
                 from_str = _decode_header_value(msg.get("From", ""))
                 to_str = _decode_header_value(msg.get("To", ""))
@@ -1265,9 +1491,7 @@ def _detect_server_restores(user_id: str, mailbox_id: str) -> int:
 
     restored = 0
     try:
-        password = decrypt(mb["encrypted_password"])
-        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
-            client.login(mb["username"], password)
+        with _imap_client_for_mailbox(mb) as client:
             client.select_folder("INBOX", readonly=True)
             for doc in trashed_docs:
                 mid = (doc.get("message_id") or "").strip()
@@ -1559,9 +1783,7 @@ def set_email_read_on_imap(user_id: str, mailbox_id: str, message_id: str, read:
     if not mb:
         return False
     try:
-        password = decrypt(mb["encrypted_password"])
-        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
-            client.login(mb["username"], password)
+        with _imap_client_for_mailbox(mb) as client:
             client.select_folder("INBOX")
             uids = _find_uids(client, message_id)
             if not uids:
@@ -1589,9 +1811,7 @@ def set_email_starred_on_imap(user_id: str, mailbox_id: str, message_id: str, st
     if not mb:
         return False
     try:
-        password = decrypt(mb["encrypted_password"])
-        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
-            client.login(mb["username"], password)
+        with _imap_client_for_mailbox(mb) as client:
             client.select_folder("INBOX")
             uids = _find_uids(client, message_id)
             if not uids:
@@ -1637,9 +1857,7 @@ def _move_email_on_imap(
         print(f"[IMAP MOVE] Mailbox not found: {mailbox_id}")
         return False
     try:
-        password = decrypt(mb["encrypted_password"])
-        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
-            client.login(mb["username"], password)
+        with _imap_client_for_mailbox(mb) as client:
             folders = [f[2] for f in client.list_folders()]
 
             target = _resolve_folder(folders, dest_folder)
@@ -1762,9 +1980,7 @@ def bulk_set_flag_on_imap(
     if not mb:
         return 0
     try:
-        password = decrypt(mb["encrypted_password"])
-        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
-            client.login(mb["username"], password)
+        with _imap_client_for_mailbox(mb) as client:
             client.select_folder("INBOX")
             uids = _collect_uids(client, message_ids)
             if not uids:
@@ -1798,9 +2014,7 @@ def bulk_move_on_imap(
     if not mb:
         return 0
     try:
-        password = decrypt(mb["encrypted_password"])
-        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
-            client.login(mb["username"], password)
+        with _imap_client_for_mailbox(mb) as client:
             folders = [f[2] for f in client.list_folders()]
 
             target = _resolve_folder(folders, dest_folder_candidates)
@@ -1914,9 +2128,7 @@ def append_sent_to_imap(user_id: str, mailbox_id: str, raw_msg_bytes: bytes) -> 
         print(f"[IMAP SENT] Mailbox not found: {mailbox_id}")
         return False
     try:
-        password = decrypt(mb["encrypted_password"])
-        with _connect_imap(mb["imap_host"], mb["imap_port"], mb["imap_secure"]) as client:
-            client.login(mb["username"], password)
+        with _imap_client_for_mailbox(mb) as client:
             folders = [f[2] for f in client.list_folders()]
             target = _pick_sent_folder(folders)
             if not target:

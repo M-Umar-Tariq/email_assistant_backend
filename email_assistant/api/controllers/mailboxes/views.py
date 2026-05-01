@@ -1,6 +1,9 @@
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
+from django.conf import settings
+from django.http import HttpResponseRedirect
+from urllib.parse import quote
 
 from api.middleware import jwt_required
 from database.serializers.mailbox_serializers import (
@@ -105,3 +108,31 @@ def mailbox_sync(request, mailbox_id):
             )
         raise
     return Response(result)
+
+
+@api_view(["GET"])
+@jwt_required
+def mailbox_google_start(request):
+    try:
+        auth_url = services.build_google_auth_url(request.user_id)
+    except ValueError as e:
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response({"auth_url": auth_url})
+
+
+@api_view(["GET"])
+def mailbox_google_callback(request):
+    code = (request.GET.get("code") or "").strip()
+    state = (request.GET.get("state") or "").strip()
+    frontend_url = getattr(settings, "FRONTEND_APP_URL", "http://localhost:3000").rstrip("/")
+    if not code or not state:
+        return HttpResponseRedirect(f"{frontend_url}/app?gmail_connect=error")
+    try:
+        mb, _user_id = services.create_google_mailbox_from_callback(code, state)
+        mb_id = mb.get("id", "")
+        mb_name = mb.get("name", "")
+        return HttpResponseRedirect(
+            f"{frontend_url}/app?gmail_connect=success&mailbox_id={quote(mb_id)}&mailbox_name={quote(mb_name)}"
+        )
+    except Exception:
+        return HttpResponseRedirect(f"{frontend_url}/app?gmail_connect=error")

@@ -5,13 +5,20 @@ from database.db import email_metadata_col, user_settings_col
 from api.utils.qdrant_helpers import scroll_all_chunk0
 
 
-def get_overview(user_id: str, days: int = 7) -> dict:
+def _base_query(user_id: str, mailbox_id: str | None = None) -> dict:
+    q: dict = {"user_id": user_id}
+    if mailbox_id:
+        q["mailbox_id"] = mailbox_id
+    return q
+
+
+def get_overview(user_id: str, days: int = 7, mailbox_id: str | None = None) -> dict:
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
     prev_start = start - timedelta(days=days)
 
-    current = {"user_id": user_id, "date": {"$gte": start}}
-    previous = {"user_id": user_id, "date": {"$gte": prev_start, "$lt": start}}
+    current = {**_base_query(user_id, mailbox_id), "date": {"$gte": start}}
+    previous = {**_base_query(user_id, mailbox_id), "date": {"$gte": prev_start, "$lt": start}}
 
     received_now = email_metadata_col().count_documents(current)
     received_prev = email_metadata_col().count_documents(previous)
@@ -23,16 +30,18 @@ def get_overview(user_id: str, days: int = 7) -> dict:
     }
 
 
-def get_volume(user_id: str, days: int = 7) -> list[dict]:
+def get_volume(user_id: str, days: int = 7, mailbox_id: str | None = None) -> list[dict]:
     now = datetime.now(timezone.utc)
     result = []
     for i in range(days - 1, -1, -1):
         day_start = (now - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
         day_end = day_start + timedelta(days=1)
-        count = email_metadata_col().count_documents({
-            "user_id": user_id,
-            "date": {"$gte": day_start, "$lt": day_end},
-        })
+        count = email_metadata_col().count_documents(
+            {
+                **_base_query(user_id, mailbox_id),
+                "date": {"$gte": day_start, "$lt": day_end},
+            }
+        )
         result.append({
             "date": day_start.strftime("%a"),
             "received": count,
@@ -40,10 +49,10 @@ def get_volume(user_id: str, days: int = 7) -> list[dict]:
     return result
 
 
-def get_top_senders(user_id: str, limit: int = 10) -> list[dict]:
+def get_top_senders(user_id: str, limit: int = 10, mailbox_id: str | None = None) -> list[dict]:
     """Aggregate top senders from inbox emails (excludes trashed and archived)."""
     pipeline = [
-        {"$match": {"user_id": user_id, "trashed": False, "archived": False, "is_sent": {"$ne": True}}},
+        {"$match": {**_base_query(user_id, mailbox_id), "trashed": False, "archived": False, "is_sent": {"$ne": True}}},
         {"$group": {
             "_id": "$from_email",
             "count": {"$sum": 1},
@@ -61,7 +70,7 @@ def get_top_senders(user_id: str, limit: int = 10) -> list[dict]:
     ]
 
 
-def get_categories(user_id: str, days: int = 7) -> list[dict]:
+def get_categories(user_id: str, days: int = 7, mailbox_id: str | None = None) -> list[dict]:
     """Aggregate user label usage from MongoDB email metadata in the last ``days`` days.
 
     Only labels that appear in the user's ``ai_label_rules`` (by name, case-insensitive)
@@ -86,7 +95,7 @@ def get_categories(user_id: str, days: int = 7) -> list[dict]:
 
     counter: Counter = Counter()
     for doc in email_metadata_col().find(
-        {"user_id": user_id, "date": {"$gte": start}},
+        {**_base_query(user_id, mailbox_id), "date": {"$gte": start}},
         {"labels": 1},
     ):
         labels = doc.get("labels") or []
@@ -106,29 +115,29 @@ def get_categories(user_id: str, days: int = 7) -> list[dict]:
     ]
 
 
-def get_metrics(user_id: str, days: int = 7) -> dict:
+def get_metrics(user_id: str, days: int = 7, mailbox_id: str | None = None) -> dict:
     now = datetime.now(timezone.utc)
     period_start = now - timedelta(days=days)
     prev_start = period_start - timedelta(days=days)
 
-    total = email_metadata_col().count_documents({"user_id": user_id})
-    unread = email_metadata_col().count_documents({"user_id": user_id, "read": False})
+    total = email_metadata_col().count_documents(_base_query(user_id, mailbox_id))
+    unread = email_metadata_col().count_documents({**_base_query(user_id, mailbox_id), "read": False})
 
     current_received = email_metadata_col().count_documents(
-        {"user_id": user_id, "date": {"$gte": period_start}}
+        {**_base_query(user_id, mailbox_id), "date": {"$gte": period_start}}
     )
     prev_received = email_metadata_col().count_documents(
-        {"user_id": user_id, "date": {"$gte": prev_start, "$lt": period_start}}
+        {**_base_query(user_id, mailbox_id), "date": {"$gte": prev_start, "$lt": period_start}}
     )
 
     current_unread = email_metadata_col().count_documents(
-        {"user_id": user_id, "read": False, "date": {"$gte": period_start}}
+        {**_base_query(user_id, mailbox_id), "read": False, "date": {"$gte": period_start}}
     )
     prev_unread = email_metadata_col().count_documents(
-        {"user_id": user_id, "read": False, "date": {"$gte": prev_start, "$lt": period_start}}
+        {**_base_query(user_id, mailbox_id), "read": False, "date": {"$gte": prev_start, "$lt": period_start}}
     )
 
-    all_emails = scroll_all_chunk0(user_id)
+    all_emails = scroll_all_chunk0(user_id, mailbox_id=mailbox_id)
     senders_current: set[str] = set()
     senders_prev: set[str] = set()
     all_senders: set[str] = set()

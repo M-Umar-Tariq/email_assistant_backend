@@ -4,6 +4,7 @@ from . import views
 urlpatterns = [
     path("ask/", views.ask, name="ai-ask"),
     path("ask/<str:email_id>/", views.ask_about_email, name="ai-ask-about-email"),
+    path("inbox-filter/", views.inbox_filter, name="ai-inbox-filter"),
     path("suggested-questions/", views.suggested_questions, name="ai-suggested"),
     path("instant-replies/<str:email_id>/", views.instant_replies, name="ai-instant-replies"),
 ]

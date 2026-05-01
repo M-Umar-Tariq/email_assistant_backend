@@ -316,7 +316,7 @@ def upsert_meeting_from_email(
     return _serialize(saved) if saved else None
 
 
-def get_today_meeting_stats(user_id: str) -> dict:
+def get_today_meeting_stats(user_id: str, mailbox_id: str | None = None) -> dict:
     """Counts and next meeting for briefing dashboard (only meetings not ended yet today)."""
     col = meetings_col()
     now = datetime.now(timezone.utc)
@@ -327,6 +327,8 @@ def get_today_meeting_stats(user_id: str) -> dict:
         "start": {"$lt": eod},
         "end": {"$gt": sod},
     }
+    if mailbox_id:
+        q["mailbox_id"] = mailbox_id
     today = list(col.find(q).sort("start", 1))
     remaining = [m for m in today if m["end"] > now]
     conflicts = sum(1 for m in remaining if m.get("conflict"))

@@ -34,10 +34,16 @@ def chat_multi(messages: list[dict], temperature: float = 0.7, max_tokens: int =
     return resp.choices[0].message.content or ""
 
 
-def chat_json(system_prompt: str, user_message: str, temperature: float = 0.7, max_tokens: int = 2048) -> dict:
+def chat_json(
+    system_prompt: str,
+    user_message: str,
+    temperature: float = 0.7,
+    max_tokens: int = 2048,
+    model: str | None = None,
+) -> dict:
     """Chat completion that returns parsed JSON using response_format."""
     resp = _client().chat.completions.create(
-        model=settings.OPENAI_CHAT_MODEL,
+        model=model or settings.OPENAI_CHAT_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},

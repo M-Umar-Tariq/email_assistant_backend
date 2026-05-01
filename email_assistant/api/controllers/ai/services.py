@@ -14,7 +14,7 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue
 from database.db import get_qdrant, email_metadata_col, mailboxes_col
 from api.utils.embedding import embed_text
 from api.utils.rerank import rerank
-from api.utils.llm import chat, chat_multi, chat_with_images
+from api.utils.llm import chat, chat_multi, chat_with_images, chat_json
 from api.utils.qdrant_helpers import get_email_content, get_emails_content_batch
 
 
@@ -1116,3 +1116,269 @@ def _extract_actions(text: str, mailbox_id: str | None = None) -> list[dict]:
 
 def _clean_response(text: str) -> str:
     return re.sub(r"```actions?\s*\n.*?\n```", "", text, flags=re.DOTALL).strip()
+
+
+# ── Natural-language → inbox filter parameters ────────────────────────────────
+
+_INBOX_FILTER_SYSTEM = """You are a smart assistant embedded inside an email inbox.
+Your PRIMARY job is to convert filtering requests into structured JSON. But you can
+also answer general questions naturally — you are not limited to filtering.
+
+TWO MODES — decide which applies before filling any field:
+
+MODE A — FILTER REQUEST (default — use this whenever possible)
+  The user wants to find, see, or ask about emails in their inbox.
+  This includes ANY question whose answer requires showing emails — even if
+  phrased as a question. Examples:
+    "show emails from Qasim"         → participants: ["Qasim"]
+    "unread this week"               → unread_only + date range
+    "starred with attachments"       → starred_only + has_attachment
+    "what is my latest email?"       → date_from: today (show today's emails)
+    "mera last email kya tha?"       → date_from: today
+    "which emails are unread?"       → unread_only: true
+    "are there any starred emails?"  → starred_only: true
+    "emails about the budget or report" → keywords_any: ["budget","report"]
+    "dikhao aaj ki emails"           → date_from: today
+  RULE: If the intent is to SEE or FIND emails, it is MODE A regardless of
+  whether it is phrased as a statement or a question.
+  → Fill the relevant filter fields AND write a helpful `response`.
+  → Set `summary` to a 3-7 word chip label.
+
+MODE B — TRULY NON-FILTERABLE
+  Only use this when the query has absolutely no email-finding intent.
+  Examples: "what is CC?", "who invented email?", "thanks", "shukriya",
+  "can you write a reply for me?", "what does BCC mean?".
+  A question about EMAIL CONTENT (latest, newest, unread count, etc.) is
+  NOT MODE B — it is MODE A with the appropriate filter applied.
+  → Leave ALL filter fields empty.
+  → Answer directly and helpfully in `response`.
+  → Set `summary` to "" (empty string).
+  → Do NOT say "I can only filter emails" — just answer naturally.
+
+Return ONLY a JSON object.
+
+Available fields (omit any you do not need):
+- "participants":      list of PEOPLE'S names or email substrings the email
+                       must involve (sender or recipient). Use this only when
+                       the user explicitly names a person they had a
+                       conversation with — e.g. "emails between Umar and
+                       Zubair", "emails with John".
+                       Strip honorifics (Mr/Mrs/Dr/Sir/Mam) and split on
+                       "and"/","/"or"/"&"/Roman Urdu "or"/"aur".
+- "participants_match":"all" if every name must appear together on the same
+                       email, "any" if either name on its own counts.
+                         • Use "all" only when the user clearly asks for a
+                           CONVERSATION between two specific people
+                           ("between X and Y", "X and Y dono", "X aur Y ki
+                           conversation").
+                         • Otherwise default to "any" — e.g. "emails from
+                           Umar or Zubair" or "show me Umar and Zubair's
+                           emails" mean either of them.
+- "from_email":        exact sender email when user clearly names one address.
+- "subject":           substring to match in the subject only.
+- "keywords":          a topic, brand, or company name to find anywhere in
+                       the email — subject, preview, sender name/domain, or
+                       body. Use this for things like "invoice", "interview",
+                       "contract", "indeed", "ebike feature", "linkedin".
+                       Multiple words = ALL of them must appear (each word
+                       is matched as a substring with case- and punctuation-
+                       insensitivity, so "ebike" matches "E-Bike").
+- "keywords_any":      list of ALTERNATIVE phrases — an email matches if it
+                       hits AT LEAST ONE phrase. Within a phrase, every word
+                       must appear (same AND rules as `keywords`). Use this
+                       for "X or Y" style queries, e.g. "emails about the
+                       quarterly report or budget" → keywords_any:
+                       ["quarterly report", "budget"]. Don't also fill
+                       `keywords` when you use this — pick one.
+- "date_from":         ISO 8601 datetime (UTC) — start of date range.
+- "date_to":           ISO 8601 datetime (UTC) — end of date range.
+- "unread_only":       true if user wants ONLY unread / unanswered / new
+                       messages ("unread", "naye", "naya", "jo nahi parhe").
+- "read_only":         true if user wants ONLY emails they've already read
+                       ("read emails", "parhi hui emails", "jo parh chuke").
+                       Mutually exclusive with unread_only — set at most one.
+- "starred_only":      true if user wants starred / important / favourite
+                       emails ("starred", "star wali", "important", "fav").
+                       Treat as Gmail's "Starred" virtual folder — covers
+                       every starred email, archived or not.
+- "has_attachment":    true/false when user mentions attachments / files /
+                       documents / pdf / image.
+- "attachment_filename": the specific attachment name to search for. Use this
+                       when the user mentions a particular file name (e.g.
+                       "Fabric Stock Report 29-4-2026", "invoice.pdf",
+                       "Q1 Budget.xlsx"). Extract the name without the
+                       extension if the user did not mention one. Implies
+                       has_attachment: true — do NOT also set has_attachment
+                       when you set this field.
+- "label":             a single AI label name (only when explicitly mentioned).
+- "summary":           MODE A: REQUIRED — 3-7 word chip label shown in the UI
+                       (e.g. "From Indeed", "Unread This Week", "Qasim & Zubair").
+                       MODE B: set to "" (empty string) — no chip will appear.
+- "response":          REQUIRED. Your reply to the user.
+                       MODE A (filter): 2-3 sentences covering what you
+                         understood, what you're filtering for, and an
+                         optional clarifying note. Aim for AT LEAST TWO
+                         sentences — never a single one-liner.
+                         • Good: "I think you meant Indeed — the jobs
+                           site. I'm pulling up emails where Indeed shows
+                           up as the sender or in the subject line. Let
+                           me know if you wanted a narrower window."
+                         • Good: "Looking for emails that touch either
+                           the quarterly report or the budget. An email
+                           matches as long as one of those topics shows
+                           up — say so if you wanted both together."
+                         • Good when nothing could be filtered (English):
+                           "I need a bit more context to filter your
+                           inbox. Could you tell me a person's name, a
+                           topic, or a date range you're looking for?"
+                         • Good when nothing could be filtered (Roman Urdu):
+                           "Mujhe thoda aur context chahiye. Bata do kis
+                           baare mein dhoondhna hai — kisi ka naam,
+                           tareekh, ya topic?"
+                       MODE B (conversational): answer the question
+                         directly and helpfully. No need to mention
+                         filtering. Be natural and concise.
+                         • Good: "BCC stands for Blind Carbon Copy. It
+                           lets you send an email to someone without
+                           other recipients seeing their address. It's
+                           handy for privacy when emailing a large group."
+                         • Good: "You're welcome! Let me know if you need
+                           anything else."
+                         • Bad: "I can only help with filtering emails."
+                         • Bad: "Filter applied." (too terse / robotic)
+                       LANGUAGE RULE (CRITICAL): Detect the language ONLY
+                       from the actual words the user typed — do NOT infer
+                       language from names or topics.
+                         • If every word is English → respond in English.
+                         • If Roman Urdu words appear (e.g. "dikhao",
+                           "wali", "aur", "se", "ki", "ka") → Roman Urdu.
+                         • If Urdu script → respond in Urdu script.
+                       A South-Asian name like "Qasim" does NOT mean
+                       the user is writing Urdu — judge by vocabulary only.
+                       NEVER leave this empty.
+
+Rules:
+- Never invent participants. If the user says one name, return that one name.
+- Treat first names as substrings — do not append a domain.
+- A single proper noun that is clearly a COMPANY / BRAND / PRODUCT (e.g.
+  "indeed", "linkedin", "amazon", "uber", "stripe") is a keyword, NOT a
+  participant. Use "keywords" for these.
+- A multi-word topic like "ebike feature" or "smart mail ai" is keywords,
+  not a participant.
+- NEVER emit BOTH `participants` and `keywords` for the same person. If the
+  user says "related to Qasim", "with Qasim", "about Qasim", "involving
+  Qasim", or "Qasim ki emails" — pick `participants: ["Qasim"]` only. Do
+  not also put "Qasim" in `keywords`. They are duplicate filters that just
+  shrink the result set.
+- Use `keywords` for SUBJECT MATTER and `participants` for PEOPLE. They are
+  not interchangeable.
+- For relative dates ("today", "this week", "last 7 days"), compute the UTC
+  ISO range yourself using the current time provided in the user message.
+- "X or Y or Z" is NEVER too vague — convert the alternatives into
+  `keywords_any: ["X", "Y", "Z"]`.
+- Default to MODE A whenever you can extract ANY filter signal. Only use
+  MODE B for greetings, thanks, or pure general-knowledge questions with
+  zero email-finding intent.
+- Questions about email content ("what is my latest email?", "which emails
+  are unread?", "are there starred emails?") are MODE A — apply the
+  relevant filter, do not leave filters empty.
+"""
+
+
+def build_inbox_filter(query: str, user_tz: str | None = None) -> dict:
+    """Convert a natural-language request into structured inbox filter params."""
+    q = (query or "").strip()
+    if not q:
+        return {"summary": "", "filters": {}}
+
+    try:
+        tz = ZoneInfo(user_tz) if user_tz else None
+    except Exception:
+        tz = None
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(tz) if tz else now_utc
+
+    user_message = (
+        f"Current UTC time: {now_utc.isoformat()}\n"
+        f"User local time: {now_local.isoformat()}\n"
+        f"User request: {q}\n\n"
+        "Return the JSON filter object."
+    )
+
+    try:
+        inbox_model = getattr(settings, "OPENAI_INBOX_FILTER_MODEL", None) or None
+        parsed = chat_json(
+            _INBOX_FILTER_SYSTEM,
+            user_message,
+            temperature=0.1,
+            max_tokens=512,
+            model=inbox_model,
+        )
+    except Exception:
+        parsed = {}
+
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    summary = str(parsed.pop("summary", "") or "").strip()
+    response_text = str(parsed.pop("response", "") or "").strip()
+    filters: dict = {}
+
+    parts = parsed.get("participants")
+    if isinstance(parts, list):
+        cleaned = [str(p).strip() for p in parts if isinstance(p, (str, int)) and str(p).strip()]
+        if cleaned:
+            filters["participants"] = cleaned
+            match = str(parsed.get("participants_match") or "all").strip().lower()
+            filters["participants_match"] = "any" if match == "any" else "all"
+
+    for key in ("from_email", "subject", "keywords", "label", "attachment_filename"):
+        v = parsed.get(key)
+        if isinstance(v, str) and v.strip():
+            filters[key] = v.strip()
+
+    kw_any = parsed.get("keywords_any")
+    if isinstance(kw_any, list):
+        cleaned_any = [
+            str(p).strip()
+            for p in kw_any
+            if isinstance(p, (str, int)) and str(p).strip()
+        ]
+        if cleaned_any:
+            filters["keywords_any"] = cleaned_any
+            # If both `keywords` and `keywords_any` are set, prefer the OR
+            # form unless `keywords` is genuinely a different phrase.
+            kw_str = (filters.get("keywords") or "").strip().lower()
+            if kw_str and any(kw_str == p.lower() for p in cleaned_any):
+                filters.pop("keywords", None)
+
+    for key in ("date_from", "date_to"):
+        v = parsed.get(key)
+        if isinstance(v, str) and v.strip():
+            try:
+                datetime.fromisoformat(v.replace("Z", "+00:00"))
+                filters[key] = v.strip()
+            except ValueError:
+                pass
+
+    for key in ("unread_only", "read_only", "starred_only", "has_attachment"):
+        v = parsed.get(key)
+        if isinstance(v, bool):
+            filters[key] = v
+    # Sanity: if both unread_only and read_only sneak in, prefer unread_only.
+    if filters.get("unread_only") and filters.get("read_only"):
+        filters.pop("read_only", None)
+
+    if filters.get("keywords") and filters.get("participants"):
+        kw_norm = re.sub(r"[^a-z0-9]+", "", filters["keywords"].lower())
+        part_norms = {re.sub(r"[^a-z0-9]+", "", p.lower()) for p in filters["participants"]}
+        if kw_norm and kw_norm in part_norms:
+            filters.pop("keywords", None)
+
+   
+    if not summary and response_text:
+        summary = response_text
+    if not response_text and summary:
+        response_text = summary
+
+    return {"summary": summary, "response": response_text, "filters": filters}

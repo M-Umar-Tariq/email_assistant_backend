@@ -11,55 +11,64 @@ from api.utils.qdrant_helpers import scroll_all_chunk0
 from api.utils.llm import chat
 
 PROFILE_TTL_HOURS = 24
+ALL_SCOPE = "__all__"
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def get_profile(user_id: str, force_rebuild: bool = False) -> dict:
+def get_profile(user_id: str, mailbox_id: str | None = None, force_rebuild: bool = False) -> dict:
+    scope = mailbox_id or ALL_SCOPE
     if not force_rebuild:
         cached = agent_profiles_col().find_one({"user_id": user_id})
         if cached:
-            expires = cached.get("expires_at")
-            if expires and (
-                (expires.tzinfo and expires > datetime.now(timezone.utc))
-                or (not expires.tzinfo and expires > datetime.utcnow())
-            ):
-                return _clean_for_response(cached)
-    return build_profile(user_id)
+            if scope == ALL_SCOPE:
+                expires = cached.get("expires_at")
+                if _is_fresh(expires):
+                    return _clean_for_response(cached)
+            else:
+                scoped = _extract_scoped_profile(cached, scope)
+                if scoped and _is_fresh(scoped.get("expires_at")):
+                    return _clean_for_response(scoped)
+    return build_profile(user_id, mailbox_id=mailbox_id)
 
 
-def build_profile(user_id: str) -> dict:
-    meta_stats = _analyse_metadata(user_id)
-    sample_emails = _get_email_samples(user_id, limit=60)
+def build_profile(user_id: str, mailbox_id: str | None = None) -> dict:
+    scope = mailbox_id or ALL_SCOPE
+    meta_stats = _analyse_metadata(user_id, mailbox_id=mailbox_id)
+    sample_emails = _get_email_samples(user_id, limit=60, mailbox_id=mailbox_id)
 
     if not sample_emails and meta_stats["total_emails"] == 0:
-        profile = _empty_profile(user_id)
-        _save_profile(profile)
+        profile = _empty_profile(user_id, mailbox_scope=scope)
+        _save_profile(profile, scope)
         return _clean_for_response(profile)
 
     profile_data = _llm_analyse(meta_stats, sample_emails)
     profile = {
         "user_id": user_id,
+        "mailbox_scope": scope,
         "email_count_analyzed": meta_stats["total_emails"],
         "built_at": datetime.now(timezone.utc),
         "expires_at": datetime.now(timezone.utc) + timedelta(hours=PROFILE_TTL_HOURS),
         **profile_data,
     }
-    _save_profile(profile)
+    _save_profile(profile, scope)
     return _clean_for_response(profile)
 
 
 # ── Metadata statistics ───────────────────────────────────────────────────────
 
-def _analyse_metadata(user_id: str) -> dict:
+def _analyse_metadata(user_id: str, mailbox_id: str | None = None) -> dict:
     col = email_metadata_col()
-    total = col.count_documents({"user_id": user_id})
-    unread = col.count_documents({"user_id": user_id, "read": False})
-    starred = col.count_documents({"user_id": user_id, "starred": True})
+    base_query: dict = {"user_id": user_id}
+    if mailbox_id:
+        base_query["mailbox_id"] = mailbox_id
+    total = col.count_documents(base_query)
+    unread = col.count_documents({**base_query, "read": False})
+    starred = col.count_documents({**base_query, "starred": True})
 
     # Sender info lives in Qdrant, not MongoDB — aggregate from there
     from collections import Counter
-    all_emails = scroll_all_chunk0(user_id)
+    all_emails = scroll_all_chunk0(user_id, mailbox_id=mailbox_id)
     sender_counter: Counter = Counter()
     sender_names: dict[str, str] = {}
     for e in all_emails:
@@ -74,14 +83,14 @@ def _analyse_metadata(user_id: str) -> dict:
     ]
 
     by_hour = list(col.aggregate([
-        {"$match": {"user_id": user_id, "date": {"$ne": None}}},
+        {"$match": {**base_query, "date": {"$ne": None}}},
         {"$project": {"hour": {"$hour": "$date"}}},
         {"$group": {"_id": "$hour", "count": {"$sum": 1}}},
         {"$sort": {"count": -1}},
     ]))
 
     by_dow = list(col.aggregate([
-        {"$match": {"user_id": user_id, "date": {"$ne": None}}},
+        {"$match": {**base_query, "date": {"$ne": None}}},
         {"$project": {"dow": {"$dayOfWeek": "$date"}}},
         {"$group": {"_id": "$dow", "count": {"$sum": 1}}},
         {"$sort": {"count": -1}},
@@ -99,8 +108,8 @@ def _analyse_metadata(user_id: str) -> dict:
 
 # ── Email sampling ────────────────────────────────────────────────────────────
 
-def _get_email_samples(user_id: str, limit: int = 60) -> list[dict]:
-    all_emails = scroll_all_chunk0(user_id)
+def _get_email_samples(user_id: str, limit: int = 60, mailbox_id: str | None = None) -> list[dict]:
+    all_emails = scroll_all_chunk0(user_id, mailbox_id=mailbox_id)
     all_emails.sort(key=lambda e: e.get("date", ""), reverse=True)
     return all_emails[:limit]
 
@@ -171,9 +180,10 @@ def _llm_analyse(meta_stats: dict, sample_emails: list[dict]) -> dict:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _empty_profile(user_id: str) -> dict:
+def _empty_profile(user_id: str, mailbox_scope: str = ALL_SCOPE) -> dict:
     return {
         "user_id": user_id,
+        "mailbox_scope": mailbox_scope,
         "email_count_analyzed": 0,
         "built_at": datetime.now(timezone.utc),
         "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
@@ -206,12 +216,47 @@ def _empty_profile_data() -> dict:
     }
 
 
-def _save_profile(profile: dict):
+def _save_profile(profile: dict, scope: str):
+    if scope == ALL_SCOPE:
+        agent_profiles_col().update_one(
+            {"user_id": profile["user_id"]},
+            {"$set": profile},
+            upsert=True,
+        )
+        return
+
+    scoped_payload = {
+        k: v for k, v in profile.items() if k != "_id"
+    }
     agent_profiles_col().update_one(
         {"user_id": profile["user_id"]},
-        {"$set": profile},
+        {
+            "$set": {
+                f"scoped_profiles.{scope}": scoped_payload,
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {"user_id": profile["user_id"]},
+        },
         upsert=True,
     )
+
+
+def _extract_scoped_profile(doc: dict, scope: str) -> dict | None:
+    scoped_profiles = doc.get("scoped_profiles")
+    if not isinstance(scoped_profiles, dict):
+        return None
+    raw = scoped_profiles.get(scope)
+    if not isinstance(raw, dict):
+        return None
+    return raw
+
+
+def _is_fresh(expires: datetime | None) -> bool:
+    if not expires:
+        return False
+    if expires.tzinfo:
+        return expires > datetime.now(timezone.utc)
+    return expires > datetime.utcnow()
 
 
 def _clean_for_response(profile: dict) -> dict:

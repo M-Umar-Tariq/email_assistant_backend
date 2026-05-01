@@ -6,18 +6,22 @@ from api.utils.llm import chat, chat_json
 from api.utils.qdrant_helpers import get_email_content, get_emails_content_batch
 
 
-def get_briefing(user_id: str) -> dict:
+def get_briefing(user_id: str, mailbox_id: str | None = None) -> dict:
     now = datetime.now(timezone.utc)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
+    base_email_query = {"user_id": user_id}
+    if mailbox_id:
+        base_email_query["mailbox_id"] = mailbox_id
+
     unread_count = email_metadata_col().count_documents({
-        "user_id": user_id, "read": False, "archived": False, "trashed": False,
+        **base_email_query, "read": False, "archived": False, "trashed": False,
     })
 
     # Get today's emails from MongoDB (use original_date to avoid
     # thread-bumped old emails appearing as today's)
     today_docs = list(email_metadata_col().find({
-        "user_id": user_id,
+        **base_email_query,
         "$or": [
             {"original_date": {"$gte": start_of_day}},
             {"original_date": None, "date": {"$gte": start_of_day}},
@@ -45,7 +49,7 @@ def get_briefing(user_id: str) -> dict:
         recent.append({"doc": doc, "content": content})
 
     # Only count follow-ups whose email still exists (e.g. not orphaned after mailbox delete)
-    valid_email_ids = list(email_metadata_col().distinct("_id", {"user_id": user_id}))
+    valid_email_ids = list(email_metadata_col().distinct("_id", base_email_query))
     valid_email_id_strs = [str(eid) for eid in valid_email_ids] if valid_email_ids else []
     fu_query_overdue = {"user_id": user_id, "status": "overdue"}
     fu_query_pending = {"user_id": user_id, "status": "pending"}
@@ -60,6 +64,8 @@ def get_briefing(user_id: str) -> dict:
     pending_follow_ups = follow_ups_col().count_documents(fu_query_pending)
 
     mailboxes = list(mailboxes_col().find({"user_id": user_id}))
+    if mailbox_id:
+        mailboxes = [mb for mb in mailboxes if str(mb.get("_id")) == mailbox_id]
     mailbox_summary = [
         {
             "id": str(mb["_id"]),
@@ -67,7 +73,8 @@ def get_briefing(user_id: str) -> dict:
             "email": mb["email"],
             "color": mb.get("color", ""),
             "unread": email_metadata_col().count_documents({
-                "user_id": user_id, "mailbox_id": str(mb["_id"]),
+                "user_id": user_id,
+                "mailbox_id": str(mb["_id"]),
                 "read": False, "archived": False, "trashed": False,
             }),
             "synced": mb.get("sync_status") == "synced",
@@ -77,10 +84,10 @@ def get_briefing(user_id: str) -> dict:
         for mb in mailboxes
     ]
 
-    briefing_items = _build_briefing_items(high_priority, recent, user_id)
+    briefing_items = _build_briefing_items(high_priority, recent, user_id, mailbox_id=mailbox_id)
 
-    mtg_stats = get_today_meeting_stats(user_id)
-    meeting_items = _meeting_briefing_items(user_id, start_of_day)
+    mtg_stats = get_today_meeting_stats(user_id, mailbox_id=mailbox_id)
+    meeting_items = _meeting_briefing_items(user_id, start_of_day, mailbox_id=mailbox_id)
 
     return {
         "stats": {
@@ -97,22 +104,23 @@ def get_briefing(user_id: str) -> dict:
     }
 
 
-def _meeting_briefing_items(user_id: str, start_of_day: datetime) -> list[dict]:
+def _meeting_briefing_items(user_id: str, start_of_day: datetime, mailbox_id: str | None = None) -> list[dict]:
     """Today's calendar entries for the briefing list (excludes meetings already ended)."""
     now = datetime.now(timezone.utc)
     end_of_day = start_of_day + timedelta(days=1)
+    query: dict = {
+        "user_id": user_id,
+        "$and": [
+            {"start": {"$lt": end_of_day}},
+            {"end": {"$gt": start_of_day}},
+            {"end": {"$gt": now}},
+        ],
+    }
+    if mailbox_id:
+        query["mailbox_id"] = mailbox_id
     docs = list(
         meetings_col()
-        .find(
-            {
-                "user_id": user_id,
-                "$and": [
-                    {"start": {"$lt": end_of_day}},
-                    {"end": {"$gt": start_of_day}},
-                    {"end": {"$gt": now}},
-                ],
-            }
-        )
+        .find(query)
         .sort("start", 1)
         .limit(8)
     )
@@ -141,7 +149,7 @@ def _meeting_briefing_items(user_id: str, start_of_day: datetime) -> list[dict]:
     return out
 
 
-def _build_briefing_items(high_priority: list, recent: list, user_id: str) -> list[dict]:
+def _build_briefing_items(high_priority: list, recent: list, user_id: str, mailbox_id: str | None = None) -> list[dict]:
     items = []
 
     for entry in high_priority:
@@ -159,7 +167,16 @@ def _build_briefing_items(high_priority: list, recent: list, user_id: str) -> li
 
     seen_ids = {item["id"] for item in items}
 
-    overdue = list(follow_ups_col().find({"user_id": user_id, "status": "overdue"}).limit(5))
+    overdue_query: dict = {"user_id": user_id, "status": "overdue"}
+    if mailbox_id:
+        scoped_ids = list(
+            email_metadata_col().distinct(
+                "_id",
+                {"user_id": user_id, "mailbox_id": mailbox_id},
+            )
+        )
+        overdue_query["email_id"] = {"$in": [str(v) for v in scoped_ids]} if scoped_ids else {"$in": []}
+    overdue = list(follow_ups_col().find(overdue_query).limit(5))
     for fu in overdue:
         if fu["email_id"] not in seen_ids:
             content = get_email_content(fu["email_id"], user_id)
@@ -191,17 +208,23 @@ def _build_briefing_items(high_priority: list, recent: list, user_id: str) -> li
     return items
 
 
-def generate_ai_briefing(user_id: str) -> list[dict]:
+def generate_ai_briefing(user_id: str, mailbox_id: str | None = None) -> list[dict]:
     """Generate per-mailbox AI summaries for today's emails only."""
     now = datetime.now(timezone.utc)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     mailboxes = list(mailboxes_col().find({"user_id": user_id}))
+    if mailbox_id:
+        mailboxes = [mb for mb in mailboxes if str(mb.get("_id")) == mailbox_id]
     if not mailboxes:
         return []
 
+    base_query: dict = {"user_id": user_id}
+    if mailbox_id:
+        base_query["mailbox_id"] = mailbox_id
+
     today_docs = list(email_metadata_col().find({
-        "user_id": user_id,
+        **base_query,
         "date": {"$gte": start_of_day},
         "archived": False,
         "trashed": False,
@@ -240,12 +263,13 @@ def generate_ai_briefing(user_id: str) -> list[dict]:
 
     sections = []
     mailbox_order = []
-    for mb_id, emails in grouped.items():
+    for idx, (mb_id, emails) in enumerate(grouped.items()):
         mb = mailbox_map.get(mb_id)
         if not mb:
             continue
         mailbox_order.append({
             "id": mb_id,
+            "idx": idx,
             "name": mb["name"],
             "email": mb["email"],
             "color": mb.get("color", "#0ea5e9"),
@@ -256,7 +280,7 @@ def generate_ai_briefing(user_id: str) -> list[dict]:
             for e in emails[:15]
         )
         sections.append(
-            f"Mailbox: {mb['name']} ({mb['email']}) — {len(emails)} emails today:\n{email_lines}"
+            f"[{idx}] Mailbox: {mb['name']} ({mb['email']}) — {len(emails)} emails today:\n{email_lines}"
         )
 
     if not sections:
@@ -272,7 +296,8 @@ def generate_ai_briefing(user_id: str) -> list[dict]:
         system_prompt=(
             "You are a smart email assistant. Analyze today's emails for each mailbox separately. "
             + prefs_hint +
-            'Return JSON: {"summaries": [{"mailbox": "exact mailbox name", "summary": "2-3 bullet points"}]}. '
+            'Return JSON: {"summaries": [{"index": 0, "mailbox": "exact mailbox name", "summary": "2-3 bullet points"}]}. '
+            "Use the numeric index shown in brackets (e.g. [0], [1]) as the `index` field. "
             "Each summary must have 2-3 concise bullet points using the • character. "
             "Mention specific senders and subjects. Be actionable and specific. "
             "If a mailbox only has routine emails, summarize briefly."
@@ -282,7 +307,39 @@ def generate_ai_briefing(user_id: str) -> list[dict]:
     )
 
     summaries = llm_result.get("summaries", [])
-    summary_map = {s.get("mailbox", ""): s.get("summary", "") for s in summaries}
+
+    # Build lookup by index (most reliable) with name/email fallbacks
+    summary_by_idx: dict[int, str] = {}
+    summary_by_name: dict[str, str] = {}
+    for s in summaries:
+        txt = s.get("summary", "")
+        if not txt:
+            continue
+        raw_idx = s.get("index")
+        if isinstance(raw_idx, int):
+            summary_by_idx[raw_idx] = txt
+        name_key = (s.get("mailbox") or "").strip().lower()
+        if name_key:
+            summary_by_name[name_key] = txt
+
+    def _resolve_summary(info: dict) -> str:
+        # 1. Match by index (most reliable)
+        if info["idx"] in summary_by_idx:
+            return summary_by_idx[info["idx"]]
+        # 2. Case-insensitive exact name match
+        name_lower = info["name"].strip().lower()
+        if name_lower in summary_by_name:
+            return summary_by_name[name_lower]
+        # 3. Partial match: LLM name contains our name or vice versa
+        for llm_name, txt in summary_by_name.items():
+            if name_lower in llm_name or llm_name in name_lower:
+                return txt
+        # 4. Email substring match
+        email_lower = info["email"].strip().lower()
+        for llm_name, txt in summary_by_name.items():
+            if email_lower in llm_name:
+                return txt
+        return "No summary available."
 
     result = []
     for info in mailbox_order:
@@ -291,7 +348,7 @@ def generate_ai_briefing(user_id: str) -> list[dict]:
             "mailbox_email": info["email"],
             "color": info["color"],
             "today_count": info["count"],
-            "summary": summary_map.get(info["name"], "No summary available."),
+            "summary": _resolve_summary(info),
         })
 
     for mb in mailboxes:

@@ -17,6 +17,7 @@ def follow_up_list_create(request):
         data = services.list_follow_ups(
             request.user_id,
             request.query_params.get("status"),
+            request.query_params.get("mailbox_id"),
         )
         return Response(data)
 

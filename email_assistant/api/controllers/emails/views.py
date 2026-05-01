@@ -89,6 +89,17 @@ def email_folder_counts(request):
 def email_list(request):
     date_from = _parse_iso_dt(request.query_params.get("date_from"))
     date_to = _parse_iso_dt(request.query_params.get("date_to"))
+    participants_raw = request.query_params.get("participants") or ""
+    participants = [p.strip() for p in participants_raw.split(",") if p.strip()] or None
+    keywords_any_raw = request.query_params.get("keywords_any") or ""
+    # Pipe separator so phrases can themselves contain commas — e.g.
+    # "quarterly report,2026|budget" → ["quarterly report,2026", "budget"].
+    keywords_any = [p.strip() for p in keywords_any_raw.split("|") if p.strip()] or None
+    has_attachment_param = request.query_params.get("has_attachment")
+    if has_attachment_param is None or has_attachment_param == "":
+        has_attachment = None
+    else:
+        has_attachment = has_attachment_param.lower() == "true"
     data = services.list_emails(
         user_id=request.user_id,
         mailbox_id=request.query_params.get("mailbox_id"),
@@ -104,6 +115,13 @@ def email_list(request):
         limit=int(request.query_params.get("limit", 50)),
         offset=int(request.query_params.get("offset", 0)),
         inbox_preset=request.query_params.get("inbox_preset") or None,
+        participants=participants,
+        participants_match=request.query_params.get("participants_match") or "all",
+        has_attachment=has_attachment,
+        attachment_filename=request.query_params.get("attachment_filename") or None,
+        starred_only=request.query_params.get("starred_only", "").lower() == "true",
+        read_only=request.query_params.get("read_only", "").lower() == "true",
+        keywords_any=keywords_any,
     )
     return Response(data)
 

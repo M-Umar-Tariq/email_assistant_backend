@@ -35,13 +35,15 @@ def chat(request):
 @api_view(["GET"])
 @jwt_required
 def profile(request):
-    return Response(services.get_user_profile(request.user_id))
+    mailbox_id = request.query_params.get("mailbox_id") or None
+    return Response(services.get_user_profile(request.user_id, mailbox_id=mailbox_id))
 
 
 @api_view(["POST"])
 @jwt_required
 def build_profile(request):
-    return Response(services.build_user_profile(request.user_id))
+    mailbox_id = request.data.get("mailbox_id") if hasattr(request, "data") else None
+    return Response(services.build_user_profile(request.user_id, mailbox_id=mailbox_id))
 
 
 @api_view(["POST"])

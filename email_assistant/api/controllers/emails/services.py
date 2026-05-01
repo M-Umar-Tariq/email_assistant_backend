@@ -1,3 +1,5 @@
+import base64
+import re
 import smtplib
 import threading
 import uuid
@@ -18,9 +20,17 @@ from database.db import (
     meetings_col,
     get_qdrant,
 )
-from api.utils.encryption import decrypt
 from api.utils.email_body import clean_email_body
-from api.utils.qdrant_helpers import get_email_content, get_emails_content_batch, get_email_ids_by_sender, scroll_all_chunk0
+from api.utils.qdrant_helpers import (
+    get_email_content,
+    get_emails_content_batch,
+    get_email_chunk0_search_haystacks,
+    get_email_ids_by_sender,
+    get_email_ids_by_participants,
+    get_email_ids_by_keywords,
+    get_email_ids_by_keywords_any,
+    scroll_all_chunk0,
+)
 from api.controllers.mailboxes import services as mailbox_services
 
 _INBOX_PRESET_KEYS = frozenset({
@@ -76,6 +86,163 @@ def _apply_inbox_preset_to_query(query: dict, preset: str, now: datetime) -> Non
 
 
 # ── List ─────────────────────────────────────────────────────────────────────
+
+def _strip_html_text(html: str) -> str:
+    if not html:
+        return ""
+    import re as _re
+    return _re.sub(r"<[^>]+>", " ", html)
+
+
+def _reply_text_for_match(reply: dict) -> tuple[str, str]:
+    """Return (header_text, body_text) for a single thread/sent reply doc.
+
+    Pulls subject, sender, every recipient and the reply body so the
+    inbox keyword/participant search can hit content that lives on the
+    replies — not just the parent email.
+    """
+    if not isinstance(reply, dict):
+        return "", ""
+    header_parts: list[str] = []
+    body_parts: list[str] = []
+
+    fn = reply.get("from_name") or ""
+    fe = reply.get("from_email") or ""
+    if fn:
+        header_parts.append(str(fn))
+    if fe:
+        header_parts.append(str(fe))
+
+    raw_to = reply.get("to") or []
+    if isinstance(raw_to, str):
+        header_parts.append(raw_to)
+    elif isinstance(raw_to, list):
+        for t in raw_to:
+            if isinstance(t, dict):
+                header_parts.append(str(t.get("name", "")))
+                header_parts.append(str(t.get("email", "")))
+            elif isinstance(t, str):
+                header_parts.append(t)
+
+    subj = reply.get("subject") or ""
+    if subj:
+        body_parts.append(str(subj))
+    prev = reply.get("preview") or ""
+    if prev:
+        body_parts.append(str(prev))
+    body = reply.get("body") or ""
+    if body:
+        body_parts.append(str(body))
+    body_html = reply.get("body_html") or ""
+    if body_html:
+        body_parts.append(_strip_html_text(body_html))
+
+    return " ".join(header_parts), " ".join(body_parts)
+
+
+def _build_reply_haystacks(
+    user_id: str,
+    mailbox_id: str | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Walk every email's `thread_replies` + `sent_replies` and produce two
+    maps keyed by email_id: a reply-body map (full text added to the body
+    haystack) and a reply-header map (sender/recipients of every reply
+    added to the header haystack).
+
+    Used to ensure the AI inbox filter sees the WHOLE conversation, not
+    just the parent email's body.
+    """
+    q: dict = {"user_id": user_id}
+    if mailbox_id:
+        q["mailbox_id"] = mailbox_id
+    # Only emails that actually have replies. Anything else contributes
+    # nothing, so skip the bandwidth.
+    q["$or"] = [
+        {"thread_replies": {"$exists": True, "$ne": []}},
+        {"sent_replies": {"$exists": True, "$ne": []}},
+    ]
+    body_map: dict[str, str] = {}
+    header_map: dict[str, str] = {}
+    cursor = email_metadata_col().find(
+        q,
+        {
+            "_id": 1,
+            "thread_replies": 1,
+            "sent_replies": 1,
+        },
+    )
+    for doc in cursor:
+        eid = str(doc.get("_id") or "")
+        if not eid:
+            continue
+        body_chunks: list[str] = []
+        header_chunks: list[str] = []
+        # Parent's own header is already in the Qdrant header map; here we
+        # only need to add what the replies contribute.
+        for reply in doc.get("thread_replies") or []:
+            h, b = _reply_text_for_match(reply)
+            if h:
+                header_chunks.append(h)
+            if b:
+                body_chunks.append(b)
+        for reply in doc.get("sent_replies") or []:
+            h, b = _reply_text_for_match(reply)
+            if h:
+                header_chunks.append(h)
+            if b:
+                body_chunks.append(b)
+        if body_chunks:
+            body_map[eid] = " ".join(body_chunks)
+        if header_chunks:
+            header_map[eid] = " ".join(header_chunks)
+    return body_map, header_map
+
+
+def _participant_email_ids_from_mongodb(
+    user_id: str,
+    mailbox_id: str | None,
+    participants: list[str],
+    match: str,
+) -> list[str]:
+    """Fast path: match people tokens against Mongo metadata only (from/to/subject/preview).
+
+    Smart Mail Filter often produces `participants` like ["Qasim"]. Scanning every Qdrant
+    chunk-0 payload is slow at scale; indexed-ish Mongo regex on headers catches the common
+    case immediately. The Qdrant pass still runs afterward with ``seed_ids`` so mentions
+    only in reply bodies / deep body text remain covered.
+    """
+    clauses: list[dict] = []
+    for raw in participants:
+        t = (raw or "").strip()
+        if not t:
+            continue
+        esc = re.escape(t)
+        rx = {"$regex": esc, "$options": "i"}
+        clauses.append({
+            "$or": [
+                {"from_name": rx},
+                {"from_email": rx},
+                {"subject": rx},
+                {"preview": rx},
+                {"to": {"$elemMatch": {"$or": [{"name": rx}, {"email": rx}]}}},
+            ]
+        })
+    if not clauses:
+        return []
+
+    q: dict = {"user_id": user_id}
+    if mailbox_id:
+        q["mailbox_id"] = mailbox_id
+
+    use_all = (match or "all").lower() != "any"
+    if use_all:
+        q["$and"] = clauses
+    else:
+        q["$or"] = clauses
+
+    col = email_metadata_col()
+    return [str(d["_id"]) for d in col.find(q, {"_id": 1})]
+
 
 def email_stats(user_id: str, mailbox_id: str | None = None) -> dict:
     """Return email counts directly from MongoDB — no Qdrant fetch, no limit cap."""
@@ -212,21 +379,36 @@ def list_emails(
     limit: int = 50,
     offset: int = 0,
     inbox_preset: str | None = None,
+    participants: list[str] | None = None,
+    participants_match: str = "all",
+    has_attachment: bool | None = None,
+    attachment_filename: str | None = None,
+    starred_only: bool = False,
+    read_only: bool = False,
+    keywords_any: list[str] | None = None,
 ) -> list[dict]:
     now = datetime.now(timezone.utc)
 
-    if folder == "trash":
+    # When the AI filter requests starred_only without an explicit folder,
+    # behave like the "Star" folder so users see EVERY starred email — not
+    # just the inbox-scoped, non-archived ones. Matches Gmail's "Starred"
+    # virtual folder behaviour ("show me my starred emails" = all of them).
+    effective_folder = folder
+    if starred_only and (not folder or folder == "inbox"):
+        effective_folder = "star"
+
+    if effective_folder == "trash":
         query: dict = {"user_id": user_id, "trashed": True,
                        "$or": [{"spam": {"$ne": True}}, {"spam": {"$exists": False}}]}
-    elif folder == "spam":
+    elif effective_folder == "spam":
         query = {"user_id": user_id, "spam": True}
-    elif folder == "sent":
+    elif effective_folder == "sent":
         query = {"user_id": user_id, "is_sent": True}
-    elif folder == "archive":
+    elif effective_folder == "archive":
         query = {"user_id": user_id, "archived": True, "trashed": False}
-    elif folder == "star":
+    elif effective_folder == "star":
         query = {"user_id": user_id, "starred": True, "trashed": False}
-    elif folder == "snoozed":
+    elif effective_folder == "snoozed":
         query = {"user_id": user_id, "trashed": False, "snoozed_until": {"$gt": now}}
     else:
         query = {"user_id": user_id, "archived": False, "trashed": False,
@@ -239,12 +421,14 @@ def list_emails(
     if mailbox_id:
         query["mailbox_id"] = mailbox_id
 
-    allow_inbox_preset = folder in (None, "", "inbox")
+    allow_inbox_preset = effective_folder in (None, "", "inbox")
     preset_key = (inbox_preset or "").strip()
     if preset_key in _INBOX_PRESET_KEYS and allow_inbox_preset:
         _apply_inbox_preset_to_query(query, preset_key, now)
     elif unread_only:
         query["read"] = False
+    elif read_only:
+        query["read"] = True
 
     if label:
         query["labels"] = label
@@ -252,16 +436,10 @@ def list_emails(
     if subject and subject.strip():
         query["subject"] = {"$regex": subject.strip(), "$options": "i"}
 
-    if keywords and keywords.strip():
-        kw_or = {
-            "$or": [
-                {"subject": {"$regex": keywords.strip(), "$options": "i"}},
-                {"preview": {"$regex": keywords.strip(), "$options": "i"}},
-            ]
-        }
-        existing_and = list(query.get("$and", []))
-        existing_and.append(kw_or)
-        query["$and"] = existing_and
+    # Keyword filtering happens against Qdrant content (subject, preview,
+    # sender, recipients, body) — see id_filter intersection below. MongoDB
+    # only stores a small subset, so a regex on `subject`/`preview` here would
+    # miss matches that live in the body or sender display name.
 
     if date_from or date_to:
         date_range: dict = {}
@@ -271,7 +449,11 @@ def list_emails(
             date_range["$lte"] = date_to
         query["date"] = date_range
 
-    # Pre-filter email IDs from Qdrant when filtering by category or sender
+    if starred_only:
+        query["starred"] = True
+
+    # Pre-filter email IDs from Qdrant when filtering by category, sender, or
+    # participant tokens (sender/recipient names + addresses).
     id_filter: list[str] | None = None
     if category:
         qdrant_emails = scroll_all_chunk0(user_id, mailbox_id=mailbox_id, category=category)
@@ -280,6 +462,81 @@ def list_emails(
     if sender_email:
         sender_ids = get_email_ids_by_sender(user_id, sender_email, mailbox_id)
         id_filter = sender_ids if id_filter is None else [eid for eid in id_filter if eid in set(sender_ids)]
+    cleaned_participants = [p for p in (participants or []) if isinstance(p, str) and p.strip()]
+    cleaned_keywords_any = [
+        p for p in (keywords_any or []) if isinstance(p, str) and p.strip()
+    ]
+    needs_reply_haystacks = (
+        bool(cleaned_participants)
+        or bool((keywords or "").strip())
+        or bool(cleaned_keywords_any)
+    )
+    reply_body_map: dict[str, str] = {}
+    reply_header_map: dict[str, str] = {}
+    chunk0_haystacks: tuple[dict[str, str], dict[str, str]] | None = None
+    if needs_reply_haystacks:
+        reply_body_map, reply_header_map = _build_reply_haystacks(user_id, mailbox_id=mailbox_id)
+        chunk0_haystacks = get_email_chunk0_search_haystacks(user_id, mailbox_id=mailbox_id)
+    if cleaned_participants:
+        mongo_seed = _participant_email_ids_from_mongodb(
+            user_id,
+            mailbox_id,
+            cleaned_participants,
+            participants_match or "all",
+        )
+        participant_ids = get_email_ids_by_participants(
+            user_id,
+            cleaned_participants,
+            match=participants_match or "all",
+            mailbox_id=mailbox_id,
+            extra_text=reply_body_map,
+            header_text=reply_header_map,
+            chunk0_haystacks=chunk0_haystacks,
+            seed_ids=mongo_seed,
+        )
+        id_filter = participant_ids if id_filter is None else [eid for eid in id_filter if eid in set(participant_ids)]
+    if keywords and keywords.strip():
+        keyword_ids = get_email_ids_by_keywords(
+            user_id,
+            keywords.strip(),
+            mailbox_id,
+            extra_text=reply_body_map,
+            chunk0_haystacks=chunk0_haystacks,
+        )
+        id_filter = keyword_ids if id_filter is None else [eid for eid in id_filter if eid in set(keyword_ids)]
+    if cleaned_keywords_any:
+        any_ids = get_email_ids_by_keywords_any(
+            user_id,
+            cleaned_keywords_any,
+            mailbox_id=mailbox_id,
+            extra_text=reply_body_map,
+            chunk0_haystacks=chunk0_haystacks,
+        )
+        id_filter = any_ids if id_filter is None else [eid for eid in id_filter if eid in set(any_ids)]
+    cleaned_attachment_filename = (attachment_filename or "").strip().lower()
+    needs_attachment_scroll = (has_attachment is not None) or bool(cleaned_attachment_filename)
+    if needs_attachment_scroll:
+        attach_emails = scroll_all_chunk0(user_id, mailbox_id=mailbox_id)
+        attach_ids: set[str] = set()
+        for c in attach_emails:
+            eid = c.get("email_id")
+            if not eid:
+                continue
+            if has_attachment is not None and bool(c.get("has_attachment")) != bool(has_attachment):
+                continue
+            if cleaned_attachment_filename:
+                attachments = c.get("attachments") or []
+                if not any(
+                    cleaned_attachment_filename in (att.get("filename") or "").lower()
+                    for att in attachments
+                    if isinstance(att, dict)
+                ):
+                    continue
+            attach_ids.add(eid)
+        if id_filter is None:
+            id_filter = list(attach_ids)
+        else:
+            id_filter = [eid for eid in id_filter if eid in attach_ids]
     if id_filter is not None:
         if not id_filter:
             return {"emails": [], "total": 0}
@@ -1208,7 +1465,7 @@ def _smtp_send(mb: dict, msg):
     as a hard error so the user isn't told "sent" when the real recipient
     silently dropped off.
     """
-    password = decrypt(mb["encrypted_password"])
+    is_oauth, credential = mailbox_services.get_smtp_auth_for_mailbox(mb)
     use_ssl = mb.get("smtp_secure", True)
     port = mb["smtp_port"]
 
@@ -1220,7 +1477,14 @@ def _smtp_send(mb: dict, msg):
             server.starttls()
 
     try:
-        server.login(mb["username"], password)
+        if is_oauth:
+            xoauth2 = f"user={mb['username']}\x01auth=Bearer {credential}\x01\x01"
+            auth_str = base64.b64encode(xoauth2.encode("utf-8")).decode("ascii")
+            code, resp = server.docmd("AUTH", "XOAUTH2 " + auth_str)
+            if code != 235:
+                raise ValueError(f"SMTP OAuth failed: {code} {resp.decode('utf-8', errors='replace') if isinstance(resp, bytes) else resp}")
+        else:
+            server.login(mb["username"], credential)
         refused = server.send_message(msg) or {}
     finally:
         server.quit()
